@@ -694,18 +694,40 @@ def delete_project_cascade(project_id: str) -> dict:
     }
 
 
-def recover_orphan_timeline_jobs(threshold_seconds: int = 300) -> list[str]:
+# Maximum plausible duration of a single timeline LLM call across all
+# retries. TIMELINE_READ_TIMEOUT (540s) * default 3 attempts + 180s
+# buffer. See RENDER_FAILURE_RECON Section 5 for the race this guards
+# against: a hermes-cli plugin load while a bridge call is still in
+# flight will mark the project failed and clobber the bridge's later
+# error_message write (last-write-wins).
+_MAX_IN_FLIGHT_TIMELINE_SECONDS = 1800
+
+
+def recover_orphan_timeline_jobs(
+    threshold_seconds: int = _MAX_IN_FLIGHT_TIMELINE_SECONDS,
+) -> list[str]:
     """Mark projects stuck at phase='timeline' with no shots as failed.
 
     Called at plugin startup to clean up orphans left by a process restart
     that interrupted a background timeline-generation task. Only projects
-    where approved_cast_at is older than `threshold_seconds` are touched,
+    where approved_cast_at is older than ``threshold_seconds`` are touched,
     so an in-flight generation that started moments before this scan runs
     is left alone.
 
+    Skips any project that still has a recent ``status='running'`` row in
+    ``generation_jobs``; that means another process is still working on
+    it. Without this guard, a hermes-cli plugin load while a bridge call
+    is still in flight will mark the project failed mid-retry and clobber
+    the bridge's own ``error_message`` write later. Default
+    ``threshold_seconds`` is 1800 (= TIMELINE_READ_TIMEOUT 540 x 3
+    attempts + 180 buffer); below that duration we assume any work is
+    still in flight.
+
     Returns the list of project IDs that were marked failed.
     """
-    cutoff = now_ts() - int(threshold_seconds)
+    now = now_ts()
+    cutoff = now - int(threshold_seconds)
+    in_flight_cutoff = now - _MAX_IN_FLIGHT_TIMELINE_SECONDS
     conn = connect()
     try:
         rows = conn.execute(
@@ -716,10 +738,16 @@ def recover_orphan_timeline_jobs(threshold_seconds: int = 300) -> list[str]:
             WHERE p.phase = 'timeline'
               AND p.approved_cast_at IS NOT NULL
               AND p.approved_cast_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM generation_jobs j
+                  WHERE j.project_id = p.id
+                    AND j.status = 'running'
+                    AND j.created_at > ?
+              )
             GROUP BY p.id
             HAVING COUNT(s.id) = 0
             """,
-            (cutoff,),
+            (cutoff, in_flight_cutoff),
         ).fetchall()
         ids = [r["id"] for r in rows]
     finally:

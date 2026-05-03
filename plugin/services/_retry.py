@@ -29,6 +29,7 @@ from .errors import (
     ProviderServerError,
     ProviderTimeoutError,
     SpriteStudioError,
+    format_provider_error,
 )
 
 
@@ -168,7 +169,15 @@ async def call_with_retry(
                     raise
                 except httpx.TimeoutException as e:
                     raise ProviderTimeoutError(
-                        str(e), provider=provider, model=model,
+                        format_provider_error(
+                            e,
+                            provider=provider,
+                            model=model,
+                            attempt=attempt.retry_state.attempt_number,
+                            max_attempts=attempts,
+                        ),
+                        provider=provider,
+                        model=model,
                     ) from e
                 classify_response(resp, provider=provider, model=model)
                 return resp
@@ -183,7 +192,17 @@ async def call_with_retry(
             http_status=final.status, request_id=final.request_id,
         )
     except RETRYABLE_TRANSPORT as e:
-        raise ProviderTimeoutError(str(e), provider=provider, model=model) from e
+        raise ProviderTimeoutError(
+            format_provider_error(
+                e,
+                provider=provider,
+                model=model,
+                attempt=attempt.retry_state.attempt_number,
+                max_attempts=attempts,
+            ),
+            provider=provider,
+            model=model,
+        ) from e
 
     raise ProviderTimeoutError(
         "retry loop exited without response", provider=provider, model=model,

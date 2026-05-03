@@ -19,7 +19,11 @@ import httpx
 
 from .. import db, env
 from . import _concurrency, _http, _pricing, _retry
-from .errors import ProviderInvalidRequestError, ProviderResponseShapeError
+from .errors import (
+    ProviderInvalidRequestError,
+    ProviderResponseShapeError,
+    format_provider_error,
+)
 
 
 logger = logging.getLogger("sprite_studio.services.tokenrouter")
@@ -199,7 +203,10 @@ class ChatClient:
                 )
             except Exception as e:
                 if job_row:
-                    db.mark_job_failed(job_row["id"], str(e))
+                    db.mark_job_failed(
+                        job_row["id"],
+                        format_provider_error(e, provider="tokenrouter", model=model),
+                    )
                 raise
 
         elapsed = time.perf_counter() - started

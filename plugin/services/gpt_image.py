@@ -25,6 +25,7 @@ from .errors import (
     ProviderInvalidRequestError,
     ProviderResponseShapeError,
     SpriteStudioError,
+    format_provider_error,
 )
 
 
@@ -138,7 +139,12 @@ class ImageClient:
                 )
             except Exception as e:
                 if job_row:
-                    db.mark_job_failed(job_row["id"], str(e))
+                    db.mark_job_failed(
+                        job_row["id"],
+                        format_provider_error(
+                            e, provider="tokenrouter", model=IMAGE_MODEL,
+                        ),
+                    )
                 raise
 
         elapsed = time.perf_counter() - started
@@ -147,7 +153,12 @@ class ImageClient:
             usage = (resp.json() or {}).get("usage", {}) or {}
         except SpriteStudioError as e:
             if job_row:
-                db.mark_job_failed(job_row["id"], str(e))
+                db.mark_job_failed(
+                    job_row["id"],
+                    format_provider_error(
+                        e, provider="tokenrouter", model=IMAGE_MODEL,
+                    ),
+                )
             raise
 
         cost = _pricing.image_cost_usd(IMAGE_MODEL, usage)
@@ -276,7 +287,12 @@ class ImageClient:
                     )
                 except Exception as e:
                     if job_row:
-                        db.mark_job_failed(job_row["id"], str(e))
+                        db.mark_job_failed(
+                            job_row["id"],
+                            format_provider_error(
+                                e, provider="tokenrouter", model=IMAGE_MODEL,
+                            ),
+                        )
                     raise
         finally:
             for fh in open_handles:
@@ -290,7 +306,12 @@ class ImageClient:
             paths = self._extract_and_save(resp, save_to=save_to, expected_count=1)
         except SpriteStudioError as e:
             if job_row:
-                db.mark_job_failed(job_row["id"], str(e))
+                db.mark_job_failed(
+                    job_row["id"],
+                    format_provider_error(
+                        e, provider="tokenrouter", model=IMAGE_MODEL,
+                    ),
+                )
             raise
         if not paths:
             if job_row:

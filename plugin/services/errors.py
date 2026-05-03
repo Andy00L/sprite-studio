@@ -1,7 +1,78 @@
 """Typed errors for the Sprite Studio service layer."""
 from __future__ import annotations
 
+import os
+import re
 from typing import Any
+
+
+_SECRET_KEY_PATTERN = re.compile(
+    r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PASSWD|AUTH)",
+    re.IGNORECASE,
+)
+_MAX_ERROR_MESSAGE_LENGTH = 500
+
+
+def _collect_secret_values() -> tuple[str, ...]:
+    """Snapshot of env values whose keys look secret-shaped, for redaction."""
+    out: list[str] = []
+    for k, v in os.environ.items():
+        if not v or len(v) < 8:
+            continue
+        if _SECRET_KEY_PATTERN.search(k):
+            out.append(v)
+    return tuple(sorted(set(out), key=len, reverse=True))
+
+
+def format_provider_error(
+    exc: BaseException,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+    attempt: int | None = None,
+    max_attempts: int | None = None,
+) -> str:
+    """Build a non-empty, sanitized, length-bounded error message for any
+    provider-call exception.
+
+    str(httpx.ReadTimeout("")) is the empty string. Same for
+    asyncio.TimeoutError() and several other body-less transport errors.
+    Writing that empty string to error_message destroys diagnostic value
+    (see RENDER_FAILURE_RECON Section 5). This helper guarantees:
+      * non-empty output (always falls back to the class name)
+      * exception class visible
+      * provider/model context included when available
+      * attempt counter included when available
+      * env-resolved secrets redacted to ***
+      * bounded length, DB-safe
+    """
+    cls = type(exc).__name__
+    raw = str(exc).strip()
+
+    head = cls if not raw else f"{cls}: {raw}"
+
+    suffix_bits: list[str] = []
+    if provider and model:
+        suffix_bits.append(f"on {provider}/{model}")
+    elif provider:
+        suffix_bits.append(f"on {provider}")
+    elif model:
+        suffix_bits.append(f"model={model}")
+    if attempt is not None:
+        if max_attempts is not None:
+            suffix_bits.append(f"attempt={attempt}/{max_attempts}")
+        else:
+            suffix_bits.append(f"attempt={attempt}")
+
+    msg = head if not suffix_bits else f"{head} ({', '.join(suffix_bits)})"
+
+    for secret in _collect_secret_values():
+        if secret and secret in msg:
+            msg = msg.replace(secret, "***")
+
+    if len(msg) > _MAX_ERROR_MESSAGE_LENGTH:
+        msg = msg[: _MAX_ERROR_MESSAGE_LENGTH - 3] + "..."
+    return msg
 
 
 class SpriteStudioError(Exception):

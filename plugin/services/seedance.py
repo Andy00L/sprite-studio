@@ -72,6 +72,7 @@ from .errors import (
     SeedanceAudioSafetyError,
     SeedanceTaskFailedError,
     SpriteStudioError,
+    format_provider_error,
 )
 
 
@@ -299,16 +300,31 @@ class VideoClient:
                         if job_row:
                             db.mark_job_failed(
                                 job_row["id"],
-                                f"submit failed (after downscale): {e2}",
+                                "submit failed (after downscale): "
+                                + format_provider_error(
+                                    e2, provider="tokenrouter", model=model,
+                                ),
                             )
                         raise
                 else:
                     if job_row:
-                        db.mark_job_failed(job_row["id"], f"submit failed: {e}")
+                        db.mark_job_failed(
+                            job_row["id"],
+                            "submit failed: "
+                            + format_provider_error(
+                                e, provider="tokenrouter", model=model,
+                            ),
+                        )
                     raise
             except Exception as e:
                 if job_row:
-                    db.mark_job_failed(job_row["id"], f"submit failed: {e}")
+                    db.mark_job_failed(
+                        job_row["id"],
+                        "submit failed: "
+                        + format_provider_error(
+                            e, provider="tokenrouter", model=model,
+                        ),
+                    )
                 raise
 
         try:
@@ -419,7 +435,13 @@ class VideoClient:
                 )
             except Exception as e:
                 if job_row_id:
-                    db.mark_job_failed(job_row_id, f"poll error: {e}")
+                    db.mark_job_failed(
+                        job_row_id,
+                        "poll error: "
+                        + format_provider_error(
+                            e, provider="tokenrouter",
+                        ),
+                    )
                 raise
 
             try:
@@ -690,7 +712,13 @@ class VideoClient:
             # Any failure after a successful poll-SUCCESS lands here; poll()
             # already handled its own errors. Mark this row failed once.
             if job_row_id:
-                db.mark_job_failed(job_row_id, f"download failed: {e}")
+                db.mark_job_failed(
+                    job_row_id,
+                    "download failed: "
+                    + format_provider_error(
+                        e, provider="tokenrouter", model=model,
+                    ),
+                )
             raise
 
         # Prefer the provider-billed token count as ground truth; fall back

@@ -39,6 +39,7 @@ from .services import (
     VoiceClient,
 )
 from .services import elevenlabs_voices
+from .services.errors import format_provider_error
 from .style_presets import (
     DEFAULT_PRESET_ID,
     StylePresetLoadError,
@@ -321,8 +322,8 @@ def _sanitize_error(msg: str) -> str:
     Caps length at 500 to keep the error_message column small and to avoid
     leaking large prompt fragments or stack traces.
     """
-    if not msg:
-        return msg
+    if not msg or not msg.strip():
+        return "unknown error (no message captured)"
     out = msg
     for pat, repl in _SANITIZE_PATTERNS:
         out = pat.sub(repl, out)
@@ -442,7 +443,10 @@ class ProjectOrchestrator:
                 base_system="You are the Sprite Studio Brief Clarifier.",
             )
         except SpriteStudioError as e:
-            db.set_phase(project_id, "failed", error_message=str(e))
+            db.set_phase(
+                project_id, "failed",
+                error_message=format_provider_error(e),
+            )
             raise
 
         needs_clarification = bool(parsed.get("needs_clarification"))
@@ -499,7 +503,10 @@ class ProjectOrchestrator:
                 read_timeout_seconds=CAST_READ_TIMEOUT,
             )
         except SpriteStudioError as e:
-            db.set_phase(project_id, "failed", error_message=_sanitize_error(str(e)))
+            db.set_phase(
+                project_id, "failed",
+                error_message=_sanitize_error(format_provider_error(e)),
+            )
             raise
 
         try:
@@ -1059,10 +1066,16 @@ class ProjectOrchestrator:
             db.set_phase(project_id, "failed", error_message=msg)
             raise
         except TimelineGenerationFailedError as e:
-            db.set_phase(project_id, "failed", error_message=str(e))
+            db.set_phase(
+                project_id, "failed",
+                error_message=format_provider_error(e),
+            )
             raise
         except SpriteStudioError as e:
-            db.set_phase(project_id, "failed", error_message=str(e))
+            db.set_phase(
+                project_id, "failed",
+                error_message=format_provider_error(e),
+            )
             raise
 
         title = _sanitize(parsed.get("title") or "").strip()[:200] or "Untitled"
@@ -1143,7 +1156,7 @@ class ProjectOrchestrator:
             logger.exception("typed error in background timeline gen")
             db.set_phase(
                 project_id, "failed",
-                error_message=_sanitize_error(str(e)),
+                error_message=_sanitize_error(format_provider_error(e)),
             )
         except Exception as e:
             logger.exception("untyped error in background timeline gen")

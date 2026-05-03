@@ -42,6 +42,7 @@ from .errors import (
     ProviderNotFoundError,
     ProviderResponseShapeError,
     SpriteStudioError,
+    format_provider_error,
 )
 
 
@@ -390,7 +391,13 @@ class VoiceClient:
                 save_to=save_to,
             )
         except Exception as e:
-            db.mark_job_failed(job_row["id"], f"narration synth failed: {e}"[:500])
+            db.mark_job_failed(
+                job_row["id"],
+                ("narration synth failed: "
+                 + format_provider_error(
+                     e, provider="elevenlabs", model=DEFAULT_MODEL_ID,
+                 ))[:500],
+            )
             raise
 
         elapsed = time.perf_counter() - started
