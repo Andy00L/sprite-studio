@@ -54,3 +54,4 @@ build_prompts/_verified_shapes/
 web/.env.local
 web/dist/
 web/build/
+build_prompts/
