@@ -441,6 +441,21 @@ def make_app(plugin: types.ModuleType, api_key: str) -> web.Application:
         if not command:
             return web.json_response({"error": "missing 'command'"}, status=400)
 
+        # Optional kwargs from the client. Web chat injects project_id here so
+        # mutating commands target the project the user is viewing instead of
+        # the backend's "latest project" fallback (P19a-27 Bug 1). Reserved
+        # keys (surface, platform) are stripped so callers can't impersonate
+        # a different gateway.
+        raw_kwargs = body.get("kwargs") or {}
+        if not isinstance(raw_kwargs, dict):
+            return web.json_response(
+                {"error": "kwargs must be an object"}, status=400,
+            )
+        client_kwargs = {
+            k: v for k, v in raw_kwargs.items()
+            if k not in ("surface", "platform")
+        }
+
         meta = slash_commands.get(command)
         if meta is None:
             return web.json_response(
@@ -450,9 +465,11 @@ def make_app(plugin: types.ModuleType, api_key: str) -> web.Application:
         handler = meta["handler"]
         try:
             if asyncio.iscoroutinefunction(handler):
-                result = await handler(args, surface="api")
+                result = await handler(args, surface="api", **client_kwargs)
             else:
-                result = await asyncio.to_thread(handler, args, surface="api")
+                result = await asyncio.to_thread(
+                    handler, args, surface="api", **client_kwargs,
+                )
         except Exception as exc:
             logger.exception("handler /%s raised", command)
             return web.json_response(

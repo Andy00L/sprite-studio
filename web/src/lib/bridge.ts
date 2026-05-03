@@ -76,7 +76,11 @@ export class SpriteBridgeClient {
     return { freed_bytes: body.freed_bytes ?? 0 };
   }
 
-  async sendSlash<T = unknown>(command: string, args = ''): Promise<SlashResult<T>> {
+  async sendSlash<T = unknown>(
+    command: string,
+    args = '',
+    kwargs: Record<string, unknown> = {},
+  ): Promise<SlashResult<T>> {
     const cleanCommand = command.replace(/^\//, '').trim();
     if (!cleanCommand) {
       throw { status: 0, message: 'sendSlash: command is empty' } as BridgeError;
@@ -93,7 +97,7 @@ export class SpriteBridgeClient {
           Authorization: `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ command: cleanCommand, args }),
+        body: JSON.stringify({ command: cleanCommand, args, kwargs }),
         signal: controller.signal,
       });
     } catch (e: unknown) {

@@ -119,3 +119,33 @@ class BudgetExceededError(SpriteStudioError):
     artifacts are preserved and the project lands in phase='failed' with an
     error_message documenting the overshoot.
     """
+
+
+class ShotEditError(SpriteStudioError):
+    """Base for shot-edit failures the handler can surface as a typed
+    response. P19a-27 introduced this so the frontend can render
+    something useful instead of '(unknown)' when an edit is rejected.
+
+    Carries the offending field name and shot id in `extra` when known,
+    so the chat dock / popover can highlight which input was bad.
+    """
+
+
+class ShotEditValidationError(ShotEditError):
+    """Field-level validation rejected the edit (bad shape, missing key,
+    char_id not in cast, etc.). Distinct from ShotEditPhaseError so the
+    frontend can flag the specific bad input rather than blocking the
+    whole popover."""
+
+
+class ShotEditPhaseError(ShotEditError):
+    """The shot's parent project is in a phase that disallows edits
+    (render in flight, done, failed). Mirrors update_shot_fields'
+    `phase_locked` reason but typed so callers above the db layer can
+    branch on it."""
+
+
+class ShotNotResolvableError(ShotEditError):
+    """Shot id / ordinal didn't resolve under the targeted project. The
+    common case after P19a-27 is when a ULID from a different project's
+    shot list gets sent to the active project's edit handler."""

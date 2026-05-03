@@ -131,9 +131,61 @@ function newId(): string {
   return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function call<T>(command: string, args = ''): Promise<T | null> {
+// Mutating slash commands that target a single project. Mirrors
+// plugin/commands.py: SLASH_COMMANDS, the handlers that resolve the
+// project via _resolve_render_target_project, _resolve_active_*_project,
+// or latest-project fallback. Web chat injects project_id from the
+// active project so the backend doesn't fall back to "latest project"
+// when the user is viewing a different one (P19a-27 Bug 1).
+//
+// Excluded on purpose:
+//   sprite_new                : creates a new project, no active context
+//   sprite_show, sprite_status, sprite_list, sprite_cost_summary,
+//   sprite_list_styles, start : read-only / non-targeted; safe to fall
+//                               through to backend's own resolution
+//   sprite_delete_project,
+//   sprite_repair_cast,
+//   sprite_purge              : already take project id as positional arg
+const MUTATING_SLASH_COMMANDS: ReadonlySet<string> = new Set([
+  'sprite_cast',
+  'sprite_edit_character',
+  'sprite_add_character',
+  'sprite_remove_character',
+  'sprite_approve_cast',
+  'sprite_approve_cast_size',
+  'sprite_timeline',
+  'sprite_edit_shot',
+  'sprite_approve_timeline',
+  'sprite_render',
+  'sprite_cancel',
+  'sprite_set_style',
+  'sprite_set_vibe',
+  'sprite_set_duration',
+  'sprite_reorder_cast',
+  'sprite_reorder_shots',
+  'sprite_edit_shot_field',
+  'sprite_set_shot_transition',
+  'sprite_add_shot',
+  'sprite_delete_shot',
+  'sprite_set_project_refs',
+]);
+
+class NoActiveProjectError extends Error {
+  command: string;
+  constructor(command: string) {
+    super(`Cannot run /${command}: no active project. Open a project first.`);
+    this.name = 'NoActiveProjectError';
+    this.command = command;
+  }
+}
+
+async function callBridge<T>(
+  command: string,
+  args: string,
+  kwargs: Record<string, unknown> = {},
+): Promise<T | null> {
   const client = getSpriteBridge();
-  const result = await client.sendSlash<T>(command, args);
+  const result = await client.sendSlash<T>(command, args, kwargs);
   if (!result.ok) {
     throw {
       status: 0,
@@ -141,6 +193,30 @@ async function call<T>(command: string, args = ''): Promise<T | null> {
     } as BridgeError;
   }
   return result.data;
+}
+
+// Active-project getter is wired up by the store after creation. The
+// indirection lets module-level `call` reach into store state without a
+// circular type dependency on AppState. Set once in the store body's
+// closure and never reassigned.
+let _getActiveProjectId: () => string | null = () => null;
+
+// Mutating commands auto-inject project_id from the active project and
+// reject with NoActiveProjectError when no project is open. Read-only
+// commands and project-targeted commands (sprite_delete_project,
+// sprite_repair_cast, sprite_purge, which take id as positional arg)
+// skip injection. The active-project read happens at call time so the
+// latest store snapshot is always consulted.
+async function call<T>(command: string, args = ''): Promise<T | null> {
+  const kwargs: Record<string, unknown> = {};
+  if (MUTATING_SLASH_COMMANDS.has(command)) {
+    const pid = _getActiveProjectId();
+    if (!pid) {
+      throw new NoActiveProjectError(command);
+    }
+    kwargs.project_id = pid;
+  }
+  return callBridge<T>(command, args, kwargs);
 }
 
 interface ProjectResponseShape {
@@ -170,7 +246,11 @@ function normalizeProjectResponse(
 }
 
 export const useStore = create<AppState>()(
-  subscribeWithSelector((set, get) => ({
+  subscribeWithSelector((set, get) => {
+    // Bind the module-level `call` helper to this store instance so
+    // mutating slash commands can read activeProjectId at call time.
+    _getActiveProjectId = () => get().activeProjectId;
+    return ({
     activeProjectId: null,
     project: null,
     characters: [],
@@ -501,23 +581,54 @@ export const useStore = create<AppState>()(
       const arg = `${ordinalOrId} | ${field}=${value}`;
       try {
         const r = await call<{
-          updated: boolean;
+          updated?: boolean;
           reason?: string;
           field?: string;
           detail?: string;
           regenerated_reference?: boolean;
+          phase?: string;
+          allowed?: string[];
+          // _err_json shape (from handler-level rejections like shot
+          // not found, no active project, phase mismatch). Surfaces
+          // alongside the structured update result so we can render a
+          // useful message instead of "(unknown)".
+          status?: string;
+          message?: string;
+          error_class?: string;
         }>('sprite_edit_shot_field', arg);
-        if (!r?.updated) {
-          // invalid_value carries a per-field detail message from the
-          // backend validator; surface it so the user sees why the write
-          // was rejected (e.g. "character_dialog[0] missing required keys").
-          const reason = r?.reason ?? 'unknown';
-          const detail = r?.detail ? `: ${r.detail}` : '';
-          set({ error: `edit ${field} failed (${reason})${detail}` });
+        if (r?.updated) {
+          await get().refreshShow();
           return;
         }
-        await get().refreshShow();
+        // Two failure shapes share this branch:
+        //   1. update_shot_fields rejected the write: {updated:false,
+        //      reason, field, detail, phase, allowed}
+        //   2. handler bailed before the update: {status:"error",
+        //      message, error_class}
+        // Render the most-specific signal available. Never collapse to
+        // "(unknown)" when any of these fields is populated.
+        let errText: string;
+        if (r?.detail) {
+          errText = r.detail;
+        } else if (r?.message) {
+          errText = r.message;
+        } else if (r?.reason === 'phase_locked' && r.phase) {
+          errText = `phase_locked (current: ${r.phase}, allowed: ${
+            (r.allowed ?? []).join(', ') || 'none'
+          })`;
+        } else if (r?.reason) {
+          errText = r.reason;
+        } else if (r?.error_class) {
+          errText = r.error_class;
+        } else {
+          errText = 'unknown';
+        }
+        set({ error: `edit ${field} failed: ${errText}` });
       } catch (e: unknown) {
+        if (e instanceof NoActiveProjectError) {
+          set({ error: e.message });
+          return;
+        }
         const err = e as BridgeError;
         set({ error: err.message });
       }
@@ -829,6 +940,13 @@ export const useStore = create<AppState>()(
         // the local cache update.
         await get().refreshShow();
       } catch (e: unknown) {
+        if (e instanceof NoActiveProjectError) {
+          // No global error state: the rejection surfaces inline only,
+          // since the user can recover by opening a project. The lobby's
+          // banner stays clean.
+          get().appendChat('system', e.message);
+          return;
+        }
         const err = e as BridgeError;
         set({ error: err.message });
         get().appendChat('system', `error: ${err.message}`);
@@ -836,7 +954,8 @@ export const useStore = create<AppState>()(
         set((s) => ({ chat: { ...s.chat, isStreaming: false } }));
       }
     },
-  })),
+    });
+  }),
 );
 
 // Past-phase navigation helpers (P19a-22).

@@ -618,12 +618,32 @@ async def sprite_new_handler(raw_args: str = "", **kwargs) -> str:
 # ---- /sprite_cast ----
 
 async def sprite_cast_handler(raw_args: str = "", **kwargs) -> str:
-    project = db.latest_project_for_user("cli", phase="brief")
-    if project is None:
-        return _err_json(
-            "no project in brief phase for user 'cli'. "
-            'Run /sprite_new "<brief>" first.',
+    # Web bridge injects project_id (P19a-27); CLI/Telegram still falls
+    # back to the latest brief-phase project for the user.
+    explicit_pid = kwargs.get("project_id") if isinstance(kwargs, dict) else None
+    project: Optional[dict] = None
+    if explicit_pid:
+        picked, picked_err, _fell_back = _pick_project(
+            kwargs, command="sprite_cast",
         )
+        if picked_err is not None:
+            return json.dumps(picked_err)
+        assert picked is not None
+        if picked["phase"] != "brief":
+            return _err_json(
+                f"project {picked['id']} is in phase {picked['phase']!r}; "
+                f"/sprite_cast requires phase 'brief'.",
+                project_id=picked["id"],
+                error_class="phase_mismatch",
+            )
+        project = picked
+    else:
+        project = db.latest_project_for_user("cli", phase="brief")
+        if project is None:
+            return _err_json(
+                "no project in brief phase for user 'cli'. "
+                'Run /sprite_new "<brief>" first.',
+            )
     project_id = project["id"]
     orchestrator = _get_orchestrator()
 
@@ -706,30 +726,128 @@ _HELP_REMOVE = (
     'usage: /sprite_remove_character "<ordinal_or_id>"'
 )
 
+_TERMINAL_PHASES = frozenset({"done", "failed"})
 
-def _resolve_active_cast_project() -> tuple[Optional[dict], Optional[str]]:
-    """Resolve the user's most-recent project across all phases. If it's
-    in 'cast' phase, return (project, None). Otherwise return
-    (None, error_message). This ensures multi-project state stays
-    coherent: the user's last touched project is the one cast-edit
-    commands operate on, even if older cast-phase projects exist.
+
+def _pick_project(
+    kwargs: Optional[dict],
+    *,
+    command: str,
+) -> tuple[Optional[dict], Optional[dict], bool]:
+    """Resolve the project a slash invocation should target.
+
+    Priority:
+      1. Explicit ``project_id`` kwarg (the web bridge injects this from
+         the user's active project, so chat commands target whatever the
+         user is viewing; P19a-27 Bug 1).
+      2. Fallback: latest project for the current user. The CLI/Telegram
+         path that does not pass a project_id keeps working unchanged.
+
+    Returns ``(project, error, fell_back)``. ``error`` is a structured
+    response dict (caller wraps with ``json.dumps``); ``fell_back`` is
+    True iff the resolution went through the latest-project fallback,
+    so mutating handlers can decide whether the resolved project is
+    actually a sensible target.
+
+    Logs WARNING on every fallback so future regressions stay visible
+    in the bridge log.
     """
+    kwargs = kwargs or {}
+    pid = kwargs.get("project_id")
+    if pid:
+        if not isinstance(pid, str) or not db._is_valid_ulid(pid):
+            return None, {
+                "status": "error",
+                "error_class": "invalid_project_id",
+                "message": f"invalid project_id: {pid!r}",
+            }, False
+        project = db.get_project(pid)
+        if project is None:
+            return None, {
+                "status": "error",
+                "error_class": "project_not_found",
+                "message": f"project not found: {pid!r}",
+                "project_id": pid,
+            }, False
+        if project.get("user_id") != _USER_ID:
+            return None, {
+                "status": "error",
+                "error_class": "forbidden",
+                "message": "project does not belong to current user",
+                "project_id": pid,
+            }, False
+        return project, None, False
+
     latest = db.latest_project_for_user(_USER_ID)
     if latest is None:
-        return None, (
-            "no project for user 'cli'. "
-            'Run /sprite_new "<brief>" first.'
+        return None, {
+            "status": "error",
+            "message": (
+                "no project for user 'cli'. "
+                'Run /sprite_new "<brief>" first.'
+            ),
+        }, True
+    logger.warning(
+        "slash command /%s: no project_id provided, falling back to "
+        "latest=%s phase=%s",
+        command, latest["id"], latest["phase"],
+    )
+    return latest, None, True
+
+
+def _terminal_fallback_response(project: dict, command: str) -> dict:
+    """Structured response for the case where a mutating slash falls back
+    to a project that's already done/failed. Surfaces the resolved id so
+    the caller can see which project was picked and decide whether to
+    re-issue with an explicit --project_id."""
+    return {
+        "status": "error",
+        "error_class": "fallback_project_in_terminal_phase",
+        "message": (
+            f"latest project '{project['id']}' is in phase "
+            f"'{project['phase']}'. Pass --project_id <id> or open the "
+            f"project you mean before re-running /{command}."
+        ),
+        "project_id": project["id"],
+        "phase": project["phase"],
+    }
+
+
+def _resolve_active_cast_project(
+    kwargs: Optional[dict] = None,
+    *,
+    command: str = "sprite_<cast>",
+) -> tuple[Optional[dict], Optional[str]]:
+    """Resolve the project for cast-phase mutating commands.
+
+    With ``project_id`` in kwargs the web bridge targets a specific
+    project (P19a-27); without it, falls back to the most-recent project
+    for the user. Returns ``(project, None)`` on success or
+    ``(None, err_json)`` where err_json is a fully-formed JSON error
+    response the caller returns directly.
+    """
+    project, err_obj, fell_back = _pick_project(kwargs, command=command)
+    if err_obj is not None:
+        return None, json.dumps(err_obj)
+    assert project is not None
+    if fell_back and project["phase"] in _TERMINAL_PHASES:
+        return None, json.dumps(
+            _terminal_fallback_response(project, command=command),
         )
-    if latest["phase"] == "cast":
-        return latest, None
-    if latest["phase"] == "timeline":
-        return None, (
-            f"cast already approved for project {latest['id']}; "
-            f"revert with /sprite_revert_cast first."
+    if project["phase"] == "cast":
+        return project, None
+    if project["phase"] == "timeline":
+        return None, _err_json(
+            f"cast already approved for project {project['id']}; "
+            f"revert with /sprite_revert_cast first.",
+            project_id=project["id"],
+            error_class="phase_mismatch",
         )
-    return None, (
-        f"latest project is in phase {latest['phase']!r}; "
-        f"cannot perform cast operations."
+    return None, _err_json(
+        f"latest project is in phase {project['phase']!r}; "
+        f"cannot perform cast operations.",
+        project_id=project["id"],
+        error_class="phase_mismatch",
     )
 
 
@@ -775,9 +893,11 @@ async def sprite_edit_character_handler(raw_args: str = "", **kwargs) -> str:
     if ref_err:
         return _err_json(ref_err)
 
-    project, err = _resolve_active_cast_project()
+    project, err = _resolve_active_cast_project(
+        kwargs, command="sprite_edit_character",
+    )
     if project is None:
-        return _err_json(err or "no active cast project")
+        return err or _err_json("no active cast project")
 
     character = _resolve_character(project, ident)
     if character is None:
@@ -859,9 +979,11 @@ async def sprite_add_character_handler(raw_args: str = "", **kwargs) -> str:
     if ref_err:
         return _err_json(ref_err)
 
-    project, err = _resolve_active_cast_project()
+    project, err = _resolve_active_cast_project(
+        kwargs, command="sprite_add_character",
+    )
     if project is None:
-        return _err_json(err or "no active cast project")
+        return err or _err_json("no active cast project")
 
     if ref_paths:
         expected_prefix = f"/{project['id']}/refs/"
@@ -922,9 +1044,11 @@ async def sprite_remove_character_handler(raw_args: str = "", **kwargs) -> str:
     if not ident:
         return _err_json(_HELP_REMOVE)
 
-    project, err = _resolve_active_cast_project()
+    project, err = _resolve_active_cast_project(
+        kwargs, command="sprite_remove_character",
+    )
     if project is None:
-        return _err_json(err or "no active cast project")
+        return err or _err_json("no active cast project")
 
     character = _resolve_character(project, ident)
     if character is None:
@@ -966,13 +1090,13 @@ async def sprite_approve_cast_handler(raw_args: str = "", **kwargs) -> str:
     # Idempotency: scope decisions to the SINGLE most-recent project, not
     # "the latest project happening to be in 'cast' phase". Otherwise a
     # second /sprite_approve_cast call would silently advance a different
-    # cast-phase project that the user did not just approve.
-    latest = db.latest_project_for_user(_USER_ID)
-    if latest is None:
-        return _err_json(
-            "no project for user 'cli'. "
-            'Run /sprite_new "<brief>" first.',
-        )
+    # cast-phase project that the user did not just approve. Honors the
+    # web bridge's project_id kwarg (P19a-27) so chat-originated approve
+    # calls hit the project the user is actually viewing.
+    latest, err, _fell_back = _pick_project(kwargs, command="sprite_approve_cast")
+    if err is not None:
+        return json.dumps(err)
+    assert latest is not None
     surface = _surface(kwargs)
     if latest["phase"] == "timeline":
         chars = db.list_characters(latest["id"])
@@ -1064,12 +1188,12 @@ async def sprite_approve_cast_size_handler(raw_args: str = "", **kwargs) -> str:
     approvable. If the cast has already advanced (or never proposed a
     large size), reply with a no-op message.
     """
-    latest = db.latest_project_for_user(_USER_ID)
-    if latest is None:
-        return _err_json(
-            "no project for user 'cli'. "
-            'Run /sprite_new "<brief>" first.',
-        )
+    latest, err, _fell_back = _pick_project(
+        kwargs, command="sprite_approve_cast_size",
+    )
+    if err is not None:
+        return json.dumps(err)
+    assert latest is not None
     if latest["phase"] != "brief":
         return _err_json(
             f"latest project is in phase {latest['phase']!r}; "
@@ -1152,26 +1276,62 @@ def _format_existing_timeline(project: dict) -> dict:
 
 
 async def sprite_timeline_handler(raw_args: str = "", **kwargs) -> str:
-    project = db.latest_project_for_user(_USER_ID, phase="timeline")
-    if project is None:
-        # Failed-orphan retry path: a project that the startup orphan-recovery
-        # marked failed (phase='failed', no shots, approved_cast_at set) is
-        # eligible for re-running timeline gen. Reset phase to 'timeline' and
-        # let the rest of the handler kick off a fresh generation.
-        latest = db.latest_project_for_user(_USER_ID)
-        if (
-            latest is not None
-            and latest["phase"] == "failed"
-            and latest.get("approved_cast_at")
-            and not db.list_shots(latest["id"])
+    # Honor the web bridge's project_id kwarg (P19a-27) so chat-originated
+    # /sprite_timeline targets the user's active project. Without kwarg,
+    # fall back to "latest project in timeline phase" for the CLI/Telegram
+    # path; if that's also empty, try the failed-orphan retry below.
+    explicit_pid = kwargs.get("project_id") if isinstance(kwargs, dict) else None
+    project: Optional[dict] = None
+    if explicit_pid:
+        picked, err, _fell_back = _pick_project(
+            kwargs, command="sprite_timeline",
+        )
+        if err is not None:
+            return json.dumps(err)
+        assert picked is not None
+        if picked["phase"] == "timeline":
+            project = picked
+        elif (
+            picked["phase"] == "failed"
+            and picked.get("approved_cast_at")
+            and not db.list_shots(picked["id"])
         ):
-            db.set_phase(latest["id"], "timeline")
-            project = db.get_project(latest["id"]) or latest
+            db.set_phase(picked["id"], "timeline")
+            project = db.get_project(picked["id"]) or picked
         else:
             return _err_json(
-                "no project in timeline phase for user 'cli'. "
-                "Run /sprite_approve_cast first.",
+                f"project {picked['id']} is in phase {picked['phase']!r}; "
+                f"cannot run /sprite_timeline.",
+                project_id=picked["id"],
+                error_class="phase_mismatch",
             )
+    else:
+        project = db.latest_project_for_user(_USER_ID, phase="timeline")
+        if project is None:
+            # Failed-orphan retry path: a project that the startup
+            # orphan-recovery marked failed (phase='failed', no shots,
+            # approved_cast_at set) is eligible for re-running timeline
+            # gen. Reset phase to 'timeline' and let the rest of the
+            # handler kick off a fresh generation.
+            latest = db.latest_project_for_user(_USER_ID)
+            if (
+                latest is not None
+                and latest["phase"] == "failed"
+                and latest.get("approved_cast_at")
+                and not db.list_shots(latest["id"])
+            ):
+                logger.warning(
+                    "slash command /sprite_timeline: no project_id "
+                    "provided, retrying failed orphan latest=%s",
+                    latest["id"],
+                )
+                db.set_phase(latest["id"], "timeline")
+                project = db.get_project(latest["id"]) or latest
+            else:
+                return _err_json(
+                    "no project in timeline phase for user 'cli'. "
+                    "Run /sprite_approve_cast first.",
+                )
     project_id = project["id"]
 
     # Idempotency: if shots already exist, return them without regenerating.
@@ -1248,26 +1408,40 @@ _HELP_EDIT_SHOT = (
 )
 
 
-def _resolve_active_timeline_project() -> tuple[Optional[dict], Optional[str]]:
-    """Resolve the user's most-recent project; if it's in 'timeline' phase
-    return it, otherwise return an error. Mirrors _resolve_active_cast_project
-    so multi-project state stays coherent."""
-    latest = db.latest_project_for_user(_USER_ID)
-    if latest is None:
-        return None, (
-            "no project for user 'cli'. "
-            'Run /sprite_new "<brief>" first.'
+def _resolve_active_timeline_project(
+    kwargs: Optional[dict] = None,
+    *,
+    command: str = "sprite_<timeline>",
+) -> tuple[Optional[dict], Optional[str]]:
+    """Resolve the project for timeline-phase mutating commands.
+
+    With ``project_id`` in kwargs (P19a-27 web bridge path) the user's
+    active project is targeted directly. Without it, falls back to the
+    most-recent project; CLI/Telegram dispatch keeps working unchanged.
+    Returns ``(project, None)`` on success or ``(None, err_json)``.
+    """
+    project, err_obj, fell_back = _pick_project(kwargs, command=command)
+    if err_obj is not None:
+        return None, json.dumps(err_obj)
+    assert project is not None
+    if fell_back and project["phase"] in _TERMINAL_PHASES:
+        return None, json.dumps(
+            _terminal_fallback_response(project, command=command),
         )
-    if latest["phase"] == "timeline":
-        return latest, None
-    if latest["phase"] == "render":
-        return None, (
-            f"timeline already approved for project {latest['id']}; "
-            f"shot edits are locked. cancel render or wait for completion."
+    if project["phase"] == "timeline":
+        return project, None
+    if project["phase"] == "render":
+        return None, _err_json(
+            f"timeline already approved for project {project['id']}; "
+            f"shot edits are locked. cancel render or wait for completion.",
+            project_id=project["id"],
+            error_class="phase_mismatch",
         )
-    return None, (
-        f"latest project is in phase {latest['phase']!r}; "
-        f"cannot perform timeline operations. Run /sprite_timeline first."
+    return None, _err_json(
+        f"latest project is in phase {project['phase']!r}; "
+        f"cannot perform timeline operations. Run /sprite_timeline first.",
+        project_id=project["id"],
+        error_class="phase_mismatch",
     )
 
 
@@ -1302,9 +1476,11 @@ async def sprite_edit_shot_handler(raw_args: str = "", **kwargs) -> str:
     if not ident or not changes:
         return _err_json(_HELP_EDIT_SHOT)
 
-    project, err = _resolve_active_timeline_project()
+    project, err = _resolve_active_timeline_project(
+        kwargs, command="sprite_edit_shot",
+    )
     if project is None:
-        return _err_json(err or "no active timeline project")
+        return err or _err_json("no active timeline project")
 
     shot = _resolve_shot(project, ident)
     if shot is None:
@@ -1357,12 +1533,12 @@ async def sprite_edit_shot_handler(raw_args: str = "", **kwargs) -> str:
 # ---- /sprite_approve_timeline ----
 
 async def sprite_approve_timeline_handler(raw_args: str = "", **kwargs) -> str:
-    latest = db.latest_project_for_user(_USER_ID)
-    if latest is None:
-        return _err_json(
-            "no project for user 'cli'. "
-            'Run /sprite_new "<brief>" first.',
-        )
+    latest, err, _fell_back = _pick_project(
+        kwargs, command="sprite_approve_timeline",
+    )
+    if err is not None:
+        return json.dumps(err)
+    assert latest is not None
     if latest["phase"] == "render":
         shots = db.list_shots(latest["id"])
         return json.dumps({
@@ -1408,18 +1584,39 @@ async def sprite_approve_timeline_handler(raw_args: str = "", **kwargs) -> str:
 
 # ---- render lifecycle helpers ----
 
-def _resolve_render_target_project() -> tuple[Optional[dict], Optional[str]]:
-    """Resolve the user's project for render-lifecycle commands. Returns
-    the most recent project regardless of phase; the caller decides
-    whether the phase is acceptable.
+def _resolve_render_target_project(
+    kwargs: Optional[dict] = None,
+    *,
+    command: str = "sprite_<render>",
+    block_terminal_fallback: bool = True,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Resolve a project for render-lifecycle / shot-edit commands.
+
+    With ``project_id`` in kwargs the web bridge targets a specific
+    project (P19a-27); without it, the legacy "latest project" fallback
+    runs. The phase guard belongs to the caller (this helper just hands
+    back the project) except when fallback resolves to a terminal-phase
+    project. There the helper short-circuits with the
+    ``fallback_project_in_terminal_phase`` error instead of letting the
+    caller silently mutate (or ``already_done``) the wrong project.
+    Set ``block_terminal_fallback=False`` for read-only / show-style
+    commands that legitimately want to surface a terminal-phase project.
+
+    Returns ``(project, None)`` on success or ``(None, err_json)``.
     """
-    latest = db.latest_project_for_user(_USER_ID)
-    if latest is None:
-        return None, (
-            "no project for user 'cli'. "
-            'Run /sprite_new "<brief>" first.'
+    project, err_obj, fell_back = _pick_project(kwargs, command=command)
+    if err_obj is not None:
+        return None, json.dumps(err_obj)
+    assert project is not None
+    if (
+        block_terminal_fallback
+        and fell_back
+        and project["phase"] in _TERMINAL_PHASES
+    ):
+        return None, json.dumps(
+            _terminal_fallback_response(project, command=command),
         )
-    return latest, None
+    return project, None
 
 
 # ---- /sprite_render ----
@@ -1428,9 +1625,11 @@ async def sprite_render_handler(raw_args: str = "", **kwargs) -> str:
     args = (_strip_brief_quotes(raw_args) or "").strip()
     confirm_budget = "--confirm-budget" in args
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_render",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     project_id = project["id"]
     phase = project["phase"]
@@ -1518,9 +1717,11 @@ async def sprite_render_handler(raw_args: str = "", **kwargs) -> str:
 # ---- /sprite_cancel ----
 
 async def sprite_cancel_handler(raw_args: str = "", **kwargs) -> str:
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_cancel",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     project_id = project["id"]
     orchestrator = _get_orchestrator()
@@ -1910,9 +2111,11 @@ async def sprite_set_style_handler(raw_args: str = "", **kwargs) -> str:
             valid=sorted(valid_ids),
         )
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_set_style",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     result = db.update_project_fields(
         project["id"],
@@ -1938,9 +2141,11 @@ async def sprite_set_vibe_handler(raw_args: str = "", **kwargs) -> str:
             error_class="invalid_args",
         )
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_set_vibe",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     result = db.update_project_fields(
         project["id"],
@@ -1978,9 +2183,11 @@ async def sprite_set_duration_handler(raw_args: str = "", **kwargs) -> str:
             valid=list(_VALID_DURATIONS),
         )
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_set_duration",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     result = db.update_project_fields(
         project["id"],
@@ -2011,9 +2218,11 @@ async def sprite_reorder_cast_handler(raw_args: str = "", **kwargs) -> str:
             error_class="invalid_args",
         )
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_reorder_cast",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     if project["phase"] not in _REORDER_EDITABLE_PHASES:
         return _err_json(
@@ -2059,9 +2268,11 @@ async def sprite_reorder_shots_handler(raw_args: str = "", **kwargs) -> str:
             error_class="invalid_args",
         )
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_reorder_shots",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     if project["phase"] not in _TIMELINE_EDITABLE_PHASES:
         return _err_json(
@@ -2090,6 +2301,18 @@ _HELP_EDIT_SHOT_FIELD = (
 _DURATION_MIN = 5
 _DURATION_MAX = 15
 
+# Maps update_shot_fields() rejection reasons onto the typed exception
+# names from services/errors.py. The frontend reads error_class from the
+# response and renders the matching message instead of "(unknown)".
+_SHOT_EDIT_REASON_TO_ERROR_CLASS: dict[str, str] = {
+    "phase_locked": "ShotEditPhaseError",
+    "invalid_value": "ShotEditValidationError",
+    "shot_not_found": "ShotNotResolvableError",
+    "project_not_found": "ShotNotResolvableError",
+    "no_safe_fields": "ShotEditValidationError",
+    "no_fields": "ShotEditValidationError",
+}
+
 
 async def sprite_edit_shot_field_handler(raw_args: str = "", **kwargs) -> str:
     """Surgical single-field shot edit. Bypasses the LLM shot_edit
@@ -2112,9 +2335,11 @@ async def sprite_edit_shot_field_handler(raw_args: str = "", **kwargs) -> str:
     if not field:
         return _err_json(_HELP_EDIT_SHOT_FIELD)
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_edit_shot_field",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     shot = _resolve_shot(project, target)
     if shot is None:
@@ -2123,6 +2348,7 @@ async def sprite_edit_shot_field_handler(raw_args: str = "", **kwargs) -> str:
             f"shot not found in your active project: {target!r}. "
             f"valid ordinals: 1..{shot_count}.",
             project_id=project["id"],
+            error_class="shot_not_found",
         )
 
     # Coerce duration_seconds to int; everything else stays str.
@@ -2171,7 +2397,7 @@ async def sprite_edit_shot_field_handler(raw_args: str = "", **kwargs) -> str:
             )
 
     fresh = db.get_shot(shot["id"]) or shot
-    return json.dumps({
+    payload: dict[str, Any] = {
         "command": "sprite_edit_shot_field",
         "project_id": project["id"],
         "shot_id": shot["id"],
@@ -2180,7 +2406,16 @@ async def sprite_edit_shot_field_handler(raw_args: str = "", **kwargs) -> str:
         "regen_error": regen_error,
         "reference_still_path": fresh.get("reference_still_path"),
         **result,
-    })
+    }
+    # Surface a typed error_class for failed update_shot_fields paths so
+    # the frontend can render something more useful than "(unknown)".
+    # P19a-27: ShotEditError + subclasses live in services/errors.py.
+    if not result.get("updated"):
+        payload["error_class"] = _SHOT_EDIT_REASON_TO_ERROR_CLASS.get(
+            result.get("reason") or "",
+            "ShotEditError",
+        )
+    return json.dumps(payload)
 
 
 # ---- /sprite_set_shot_transition ----
@@ -2217,9 +2452,11 @@ async def sprite_set_shot_transition_handler(raw_args: str = "", **kwargs) -> st
             error_class="invalid_args",
         )
 
-    project, err = _resolve_render_target_project()
+    project, err = _resolve_render_target_project(
+        kwargs, command="sprite_set_shot_transition",
+    )
     if project is None:
-        return _err_json(err or "no active project")
+        return err or _err_json("no active project")
 
     shot = _resolve_shot(project, target)
     if shot is None:
@@ -2312,9 +2549,11 @@ async def sprite_add_shot_handler(raw_args: str = "", **kwargs) -> str:
             error_class="invalid_args",
         )
 
-    project, err = _resolve_active_timeline_project()
+    project, err = _resolve_active_timeline_project(
+        kwargs, command="sprite_add_shot",
+    )
     if project is None:
-        return _err_json(err or "no active timeline project")
+        return err or _err_json("no active timeline project")
     project_id = project["id"]
 
     # Parse optional kv pairs.
@@ -2452,9 +2691,11 @@ async def sprite_delete_shot_handler(raw_args: str = "", **kwargs) -> str:
     if not ident:
         return _err_json(_HELP_DELETE_SHOT, error_class="invalid_args")
 
-    project, err = _resolve_active_timeline_project()
+    project, err = _resolve_active_timeline_project(
+        kwargs, command="sprite_delete_shot",
+    )
     if project is None:
-        return _err_json(err or "no active timeline project")
+        return err or _err_json("no active timeline project")
     project_id = project["id"]
 
     shot = _resolve_shot(project, ident)
@@ -2520,12 +2761,32 @@ async def sprite_set_project_refs_handler(raw_args: str = "", **kwargs) -> str:
             "usage: /sprite_set_project_refs path1,path2,...",
         )
 
-    project = db.latest_project_for_user(_USER_ID, phase="brief")
-    if project is None:
-        return _err_json(
-            "no project in brief phase for user 'cli'. "
-            'Run /sprite_new "<brief>" defer_cast=true first.',
+    # Honor explicit project_id (P19a-27) for the chat path; otherwise
+    # fall back to the latest brief-phase project for the CLI surface.
+    explicit_pid = kwargs.get("project_id") if isinstance(kwargs, dict) else None
+    project: Optional[dict] = None
+    if explicit_pid:
+        picked, picked_err, _fell_back = _pick_project(
+            kwargs, command="sprite_set_project_refs",
         )
+        if picked_err is not None:
+            return json.dumps(picked_err)
+        assert picked is not None
+        if picked["phase"] != "brief":
+            return _err_json(
+                f"project {picked['id']} is in phase {picked['phase']!r}; "
+                f"refs can only be bound during the brief phase.",
+                project_id=picked["id"],
+                error_class="phase_mismatch",
+            )
+        project = picked
+    else:
+        project = db.latest_project_for_user(_USER_ID, phase="brief")
+        if project is None:
+            return _err_json(
+                "no project in brief phase for user 'cli'. "
+                'Run /sprite_new "<brief>" defer_cast=true first.',
+            )
 
     paths, err = _parse_refs_kv(raw)
     if err:
