@@ -1,0 +1,23 @@
+{
+  "name": "sprite-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hermes-orchestrated AI video creation studio. Web canvas + plugin + bridge.",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "dev": "concurrently -n bridge,web -c blue,green --kill-others-on-fail \"npm:dev:bridge\" \"npm:dev:web\"",
+    "dev:bridge": "node scripts/run-bridge.mjs",
+    "dev:web": "npm --prefix web run dev",
+    "kill:bridge": "bash scripts/kill-bridge.sh",
+    "setup": "node scripts/setup.mjs",
+    "check": "node scripts/preflight.mjs",
+    "build": "npm --prefix web run build",
+    "lint": "npm --prefix web run lint",
+    "typecheck": "npm --prefix web exec -- tsc --noEmit"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

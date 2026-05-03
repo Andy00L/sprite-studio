@@ -1,0 +1,44 @@
+name: sprite-studio
+version: 0.1.0
+description: AI video creation studio with persistent character casts (Hermes Creative Hackathon)
+author: drew
+provides_commands:
+  - start
+  - sprite_new
+  - sprite_status
+  - sprite_cast
+  - sprite_edit_character
+  - sprite_add_character
+  - sprite_remove_character
+  - sprite_approve_cast
+  - sprite_approve_cast_size
+  - sprite_timeline
+  - sprite_edit_shot
+  - sprite_approve_timeline
+  - sprite_render
+  - sprite_cancel
+  - sprite_show
+  - sprite_purge
+  - sprite_list
+  - sprite_cost_summary
+  - sprite_list_styles
+  - sprite_set_style
+  - sprite_set_vibe
+  - sprite_set_duration
+  - sprite_reorder_cast
+  - sprite_reorder_shots
+  - sprite_edit_shot_field
+  - sprite_set_shot_transition
+  - sprite_add_shot
+  - sprite_delete_shot
+  - sprite_set_project_refs
+provides_hooks: []
+requires_env:
+  - name: TOKENROUTER_API_KEY
+    description: TokenRouter API key with access to Kimi K2.6, gpt-5.4-image-2, and Seedance 2.0
+    url: https://app.tokenrouter.com
+    secret: true
+  - name: ELEVENLABS_API_KEY
+    description: ElevenLabs API key for narration TTS
+    url: https://elevenlabs.io/app/settings/api-keys
+    secret: true

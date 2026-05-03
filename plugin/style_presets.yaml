@@ -1,0 +1,136 @@
+- id: cartoon_classic
+  name: Classic Cartoon
+  descriptor: |
+    Modern 2D cartoon illustration. Bold confident outlines (~2px),
+    soft cel shading with gentle gradients, vibrant but harmonious palette.
+    Slightly oversized eyes and expressive faces. Smooth round shapes.
+    Light reads as soft directional with subtle bounce.
+  render_notes: |
+    No photorealism. No painterly textures. No 3D rendering.
+    Solid block colors with controlled gradient transitions.
+  motion_descriptor: |
+    Smooth animated motion at 24fps. Bouncy, slightly anticipatory movements.
+    No motion blur on character faces.
+  music_tag: cartoon_upbeat
+  example_image: examples/cartoon_classic.png
+
+- id: pixar_3d
+  name: Pixar-Style 3D
+  descriptor: |
+    Stylized 3D animation rendering, Pixar-influenced look. Subsurface
+    scattering on skin, soft global illumination, slight depth of field.
+    Heroic but warm character designs with appealing simplified anatomy.
+    Studio-quality material rendering.
+  render_notes: |
+    Cinematic but not photorealistic. Slightly hyper-saturated.
+    Hero lighting on faces.
+  motion_descriptor: |
+    Smooth physics-based motion. Anticipation and follow-through.
+    Subtle hair and cloth dynamics.
+  music_tag: orchestral_warm
+
+- id: watercolor_book
+  name: Watercolor Children's Book
+  descriptor: |
+    Hand-painted watercolor illustration, classic picture-book style.
+    Visible paper grain and watercolor bleeds. Soft pastel palette,
+    gentle imperfect edges, ink line accents over wash areas.
+    Charming, soft, slightly nostalgic feel.
+  render_notes: |
+    No digital sharpness. Embrace organic edge variation.
+    Warm muted tones. Subtle paper texture.
+  motion_descriptor: |
+    Gentle flowing motion. Slow paced. Like turning pages of a book.
+  music_tag: gentle_piano
+
+- id: anime_modern
+  name: Modern Anime
+  descriptor: |
+    Contemporary anime illustration. Clean lineart, large expressive eyes,
+    cel shading with one or two shadow tones. Vivid hair colors permitted.
+    Slight emphasis on dramatic angles and emotional poses.
+  render_notes: |
+    Sharp clean lines. Limited color palette per character.
+    Dramatic backlighting common.
+  motion_descriptor: |
+    Held key poses with snappy transitions. Speed lines on action.
+  music_tag: anime_emotional
+
+- id: cinematic_realism
+  name: Cinematic Realism
+  descriptor: |
+    Photorealistic cinematic look. Shot on 35mm film aesthetic, shallow
+    depth of field, natural skin tones, realistic textures and materials.
+    Natural lighting, golden hour bias, subtle film grain.
+  render_notes: |
+    Avoid uncanny faces. Prefer mid and wide shots over extreme close-ups.
+    Aim for documentary or indie-film mood.
+  motion_descriptor: |
+    Naturalistic motion. Slight handheld camera feel.
+    No exaggerated cartoon physics.
+  music_tag: cinematic_strings
+
+- id: ghibli_inspired
+  name: Hand-Drawn Painted (Ghibli-inspired)
+  descriptor: |
+    Hand-drawn 2D animation style with painterly backgrounds.
+    Soft pastel skies, lush detailed nature, gentle warm character designs.
+    Background art reads as actual paintings.
+  render_notes: |
+    Backgrounds far more detailed than characters. Characters slightly simplified.
+    Avoid using copyrighted Ghibli characters or specific film references.
+  motion_descriptor: |
+    Quiet observation moments. Slow pans across landscapes.
+    Subtle wind effects on hair, clothes, leaves.
+  music_tag: gentle_piano
+
+- id: pixel_art_retro
+  name: Pixel Art Retro
+  descriptor: |
+    16-bit era pixel art aesthetic, ~96x96 character resolution scaled up.
+    Limited 32-color palette. Visible chunky pixels. Sprite-style outlines.
+    SNES/Genesis-era feel.
+  render_notes: |
+    Scaling artifacts welcome. Dithering acceptable.
+    No anti-aliasing on pixel edges.
+  motion_descriptor: |
+    Frame-by-frame animation feel. ~12fps even though delivered at 24.
+    Slight stutter is part of the charm.
+  music_tag: chiptune_adventure
+
+- id: noir_comic
+  name: Noir Comic Book
+  descriptor: |
+    Black and white comic book illustration with high contrast inking.
+    Heavy shadow shapes, dramatic angles, halftone patterns for grays.
+    Selective spot color (red, yellow) for emphasis.
+  render_notes: |
+    Mostly black and white with one accent color.
+    Dramatic chiaroscuro lighting.
+  motion_descriptor: |
+    Hard cuts between panels. Static held shots with subtle camera moves.
+  music_tag: jazz_noir
+
+- id: storybook_3d
+  name: Storybook 3D
+  descriptor: |
+    Soft sculpted 3D look like a stop-motion children's film.
+    Characters appear made of felt, clay, or paper. Soft warm lighting.
+    Cozy palettes.
+  render_notes: |
+    Very tactile material feel. Slight imperfections embraced.
+  motion_descriptor: |
+    Slightly stop-motion judder. Soft and bouncy.
+  music_tag: cozy_acoustic
+
+- id: cyberpunk_neon
+  name: Cyberpunk Neon
+  descriptor: |
+    Neon-saturated futuristic illustration. Deep blacks, electric cyan and
+    magenta lighting, wet-street reflections, holographic signage.
+    Asian-megacity influence. High contrast.
+  render_notes: |
+    Lighting drives the entire image. Most surfaces are dark with neon rim light.
+  motion_descriptor: |
+    Slow camera moves through neon environments. Dramatic glow on motion.
+  music_tag: synth_dark

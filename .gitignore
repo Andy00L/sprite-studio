@@ -1,0 +1,56 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Node
+node_modules/
+dist/
+build/
+.vite/
+.next/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Local agent / Claude tooling (not part of the project)
+.claude/
+.agents/
+skills-lock.json
+
+# Plugin runtime state (must NEVER ship)
+plugin/state.db
+plugin/projects/
+plugin/run/
+plugin/cron/
+plugin/music_library/
+plugin/**/__pycache__/
+
+# Heavy reference assets (not needed to run the project)
+web/_design_reference/
+build_prompts/_production/
+build_prompts/_smoke_test/
+build_prompts/_verified_shapes/
+
+# Logs
+*.log
+/tmp/sprite_bridge*.log
+
+# Web app local secrets (defense in depth)
+web/.env.local
+web/dist/
+web/build/

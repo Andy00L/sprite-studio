@@ -1,0 +1,764 @@
+import { create } from 'zustand';
+import { subscribeWithSelector } from 'zustand/middleware';
+import { getSpriteBridge, type BridgeError } from '../lib/bridge';
+import { checkAssetServer } from '../lib/assets';
+import type {
+  Character,
+  Project,
+  ProjectListEntry,
+  Shot,
+  ShotTransition,
+  RenderStatusResponse,
+  StylePreset,
+} from '../types/sprite';
+
+export type LobbyFilter = 'all' | 'in-flight' | 'done' | 'drafts';
+
+// Popover state. Single-valued so two popovers can never overlap.
+// PopoverHost reads this and mounts the matching component.
+export type PopoverState =
+  | { kind: 'none' }
+  | { kind: 'character-edit'; characterId: string }
+  | { kind: 'character-add' }
+  | { kind: 'shot-edit'; shotId: string }
+  | { kind: 'shot-add'; insertAfterOrdinal: number }
+  | { kind: 'transition'; shotId: string };
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  text: string;
+  timestamp: number;
+}
+
+interface ChatState {
+  messages: ChatMessage[];
+  isStreaming: boolean;
+  draft: string;
+}
+
+interface AppState {
+  activeProjectId: string | null;
+  project: Project | null;
+  characters: Character[];
+  shots: Shot[];
+  status: RenderStatusResponse | null;
+  chat: ChatState;
+  error: string | null;
+  assetServerUp: boolean | null;
+  stylePresets: StylePreset[];
+  projects: ProjectListEntry[];
+  isPolling: boolean;
+  pollIntervalMs: number;
+  popover: PopoverState;
+
+  setActiveProject(id: string | null): void;
+  setError(msg: string | null): void;
+  appendChat(role: ChatMessage['role'], text: string): void;
+  setDraft(text: string): void;
+  openPopover(p: PopoverState): void;
+  closePopover(): void;
+
+  loadProjects(filter?: LobbyFilter): Promise<void>;
+  openProject(projectId: string): Promise<void>;
+  newProject(brief: string, opts?: { deferCast?: boolean }): Promise<void>;
+  setProjectRefs(paths: string[]): Promise<void>;
+  startCast(): Promise<void>;
+  addCharacter(description: string, refs?: string[]): Promise<void>;
+  editCharacterRefs(
+    ordinalOrId: string | number,
+    changes: string,
+    refs: string[],
+  ): Promise<void>;
+  approveCast(): Promise<void>;
+  generateTimeline(): Promise<void>;
+  approveTimeline(): Promise<void>;
+  startRender(): Promise<void>;
+  cancelRender(): Promise<void>;
+  refreshStatus(projectId?: string): Promise<void>;
+  refreshShow(projectId?: string): Promise<void>;
+  editCharacter(ordinalOrId: string | number, changes: string): Promise<void>;
+  editShot(ordinalOrId: string | number, changes: string): Promise<void>;
+  editShotNL(ordinalOrId: string | number, changes: string): Promise<void>;
+  editShotField(
+    ordinalOrId: string | number,
+    field: string,
+    value: string | number,
+  ): Promise<void>;
+  reorderShots(shotIds: string[]): Promise<void>;
+  startProgressPolling(intervalMs?: number): void;
+  stopProgressPolling(): void;
+
+  checkAssets(): Promise<void>;
+  loadStylePresets(): Promise<void>;
+  setStyle(presetId: string): Promise<void>;
+  setVibe(vibe: string): Promise<void>;
+  setDuration(seconds: number): Promise<void>;
+  reorderCast(charIds: string[]): Promise<void>;
+  removeCharacter(charIdOrOrdinal: string | number): Promise<void>;
+  regenerateCharacter(ordinalOrId: string | number): Promise<void>;
+  setCharacterField(
+    ordinalOrId: string | number,
+    field: 'persona' | 'visual_description' | 'appearance',
+    value: string,
+  ): Promise<void>;
+  addShot(
+    ordinal: number,
+    action: string,
+    kvs?: Record<string, string>,
+  ): Promise<void>;
+  deleteShot(shotId: string | number): Promise<void>;
+  setShotTransition(
+    shotIdOrOrdinal: string | number,
+    transition: ShotTransition,
+  ): Promise<void>;
+  sendRaw(text: string): Promise<void>;
+}
+
+function newId(): string {
+  return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function call<T>(command: string, args = ''): Promise<T | null> {
+  const client = getSpriteBridge();
+  const result = await client.sendSlash<T>(command, args);
+  if (!result.ok) {
+    throw {
+      status: 0,
+      message: `slash returned non-JSON: ${result.parseError ?? 'empty'}`,
+    } as BridgeError;
+  }
+  return result.data;
+}
+
+interface ProjectResponseShape {
+  project_id?: string;
+  id?: string;
+}
+
+// Bridge handlers key projects as `project_id`; the TS `Project` interface
+// uses `id`. Apply at every site that hydrates a project from a bridge
+// response so read sites can stay simple. Returns null when data is empty
+// (caller bails silently; a no-project-for-user reply is normal) or when
+// it carries no id at all (logs the invariant violation, then bails).
+// Idempotent: if `id` is already present, the existing value wins.
+function normalizeProjectResponse(
+  data: ProjectResponseShape | null | undefined,
+): Project | null {
+  if (!data) return null;
+  const id = data.id ?? data.project_id;
+  if (typeof id !== 'string' || id.length === 0) {
+    console.error(
+      'normalizeProjectResponse: response missing project id',
+      data,
+    );
+    return null;
+  }
+  return { ...data, id } as unknown as Project;
+}
+
+export const useStore = create<AppState>()(
+  subscribeWithSelector((set, get) => ({
+    activeProjectId: null,
+    project: null,
+    characters: [],
+    shots: [],
+    status: null,
+    chat: { messages: [], isStreaming: false, draft: '' },
+    error: null,
+    assetServerUp: null,
+    stylePresets: [],
+    projects: [],
+    isPolling: false,
+    pollIntervalMs: 3000,
+    popover: { kind: 'none' },
+
+    setActiveProject: (id) => set({ activeProjectId: id }),
+    setError: (msg) => set({ error: msg }),
+    openPopover: (p) => set({ popover: p }),
+    closePopover: () => set({ popover: { kind: 'none' } }),
+    appendChat: (role, text) =>
+      set((s) => ({
+        chat: {
+          ...s.chat,
+          messages: [
+            ...s.chat.messages,
+            { id: newId(), role, text, timestamp: Date.now() },
+          ],
+        },
+      })),
+    setDraft: (text) => set((s) => ({ chat: { ...s.chat, draft: text } })),
+
+    loadProjects: async (filter = 'all') => {
+      // The bridge filters by phase server-side for 'done' and 'drafts'
+      // (single phase) but 'in-flight' spans cast/timeline/render, so we fetch
+      // unfiltered and narrow on the client to keep the bridge contract
+      // simple (single --phase arg, no list-of-phases flag).
+      try {
+        const phaseArg =
+          filter === 'done'
+            ? 'done'
+            : filter === 'drafts'
+              ? 'brief'
+              : '';
+        const r = await call<{
+          count: number;
+          projects: ProjectListEntry[];
+          phase_filter: string | null;
+        }>('sprite_list', phaseArg ? `--phase ${phaseArg}` : '');
+        let projects = r?.projects ?? [];
+        if (filter === 'in-flight') {
+          projects = projects.filter((p) =>
+            ['cast', 'timeline', 'render'].includes(p.phase),
+          );
+        }
+        set({ projects });
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message ?? 'failed to load projects' });
+      }
+    },
+
+    openProject: async (projectId) => {
+      set({ activeProjectId: projectId });
+      await get().refreshShow(projectId);
+      await get().refreshStatus(projectId);
+    },
+
+    newProject: async (brief, opts) => {
+      const quoted = `"${brief.replace(/"/g, '\\"')}"`;
+      const args = opts?.deferCast ? `${quoted} defer_cast=true` : quoted;
+      get().appendChat('user', `/sprite_new ${args}`);
+      try {
+        const r = await call<{ project_id: string; status?: string }>(
+          'sprite_new',
+          args,
+        );
+        if (r?.project_id) {
+          set({ activeProjectId: r.project_id });
+          get().appendChat('assistant', JSON.stringify(r, null, 2));
+          await get().refreshShow(r.project_id);
+        } else {
+          get().appendChat('assistant', JSON.stringify(r, null, 2));
+        }
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+        get().appendChat('system', `error: ${err.message}`);
+      }
+    },
+
+    setProjectRefs: async (paths) => {
+      if (paths.length === 0) return;
+      const args = paths.join(',');
+      get().appendChat('user', `/sprite_set_project_refs ${args}`);
+      try {
+        const r = await call<{ status: string; refs: string[] }>(
+          'sprite_set_project_refs',
+          args,
+        );
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+        get().appendChat('system', `error: ${err.message}`);
+      }
+    },
+
+    startCast: async () => {
+      get().appendChat('user', '/sprite_cast');
+      try {
+        const r = await call<unknown>('sprite_cast');
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+        get().appendChat('system', `error: ${err.message}`);
+      }
+    },
+
+    approveCast: async () => {
+      get().appendChat('user', '/sprite_approve_cast');
+      try {
+        const r = await call<unknown>('sprite_approve_cast');
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    generateTimeline: async () => {
+      get().appendChat('user', '/sprite_timeline');
+      try {
+        const r = await call<unknown>('sprite_timeline');
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    approveTimeline: async () => {
+      get().appendChat('user', '/sprite_approve_timeline');
+      try {
+        const r = await call<unknown>('sprite_approve_timeline');
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    startRender: async () => {
+      get().appendChat('user', '/sprite_render');
+      try {
+        const r = await call<unknown>('sprite_render');
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshStatus();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    cancelRender: async () => {
+      get().appendChat('user', '/sprite_cancel');
+      try {
+        const r = await call<unknown>('sprite_cancel');
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshStatus();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    refreshStatus: async (projectId) => {
+      try {
+        const status = await call<RenderStatusResponse>(
+          'sprite_status',
+          projectId ?? '',
+        );
+        set({ status });
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    refreshShow: async (projectId) => {
+      try {
+        const targetId = projectId ?? get().activeProjectId ?? '';
+        const data = await call<
+          {
+            project_id: string;
+            phase: string;
+            characters: Character[];
+            shots: Shot[];
+          } & Project
+        >('sprite_show', targetId);
+        const project = normalizeProjectResponse(data);
+        if (!project) return;
+        set({
+          activeProjectId: project.id,
+          project,
+          characters: data?.characters ?? [],
+          shots: data?.shots ?? [],
+        });
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        // First-load with no project yet returns "no project for user";
+        // that's expected, not an error worth surfacing.
+        if (err.message?.includes('no project for user')) return;
+        set({ error: err.message });
+      }
+    },
+
+    editCharacter: async (ordinalOrId, changes) => {
+      const args = `"${`${ordinalOrId} | ${changes}`.replace(/"/g, '\\"')}"`;
+      get().appendChat('user', `/sprite_edit_character ${args}`);
+      try {
+        const r = await call<unknown>('sprite_edit_character', args);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    editShot: async (ordinalOrId, changes) => {
+      // Backwards-compatible alias for editShotNL — older callers (sendRaw
+      // chat path, ShotPanel from P15) still hit this name.
+      await get().editShotNL(ordinalOrId, changes);
+    },
+
+    editShotNL: async (ordinalOrId, changes) => {
+      const args = `"${`${ordinalOrId} | ${changes}`.replace(/"/g, '\\"')}"`;
+      get().appendChat('user', `/sprite_edit_shot ${args}`);
+      try {
+        const r = await call<unknown>('sprite_edit_shot', args);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    editShotField: async (ordinalOrId, field, value) => {
+      // Surgical /sprite_edit_shot_field: bypasses the LLM translator for
+      // trivial edits like duration tweaks. Visual fields trigger
+      // reference-still regen server-side.
+      //
+      // Args go through the bridge as JSON, not shell, so no outer-quote
+      // wrap is needed. Wrapping with `"..."` (and escaping inner `"` as
+      // `\"`) breaks JSON-valued fields like characters_present and
+      // character_dialog because Python's _strip_brief_quotes leaves the
+      // backslashes in place, and json.loads then rejects the column on
+      // read. Sending the raw arg lets all field types round-trip.
+      const arg = `${ordinalOrId} | ${field}=${value}`;
+      try {
+        const r = await call<{
+          updated: boolean;
+          reason?: string;
+          field?: string;
+          detail?: string;
+          regenerated_reference?: boolean;
+        }>('sprite_edit_shot_field', arg);
+        if (!r?.updated) {
+          // invalid_value carries a per-field detail message from the
+          // backend validator; surface it so the user sees why the write
+          // was rejected (e.g. "character_dialog[0] missing required keys").
+          const reason = r?.reason ?? 'unknown';
+          const detail = r?.detail ? `: ${r.detail}` : '';
+          set({ error: `edit ${field} failed (${reason})${detail}` });
+          return;
+        }
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    reorderShots: async (shotIds) => {
+      // Optimistic update — paint the new order immediately, roll back if
+      // the bridge rejects (phase lock, mismatch, network).
+      const before = get().shots;
+      const byId = new Map(before.map((s) => [s.id, s] as const));
+      const ordered = shotIds
+        .map((id) => byId.get(id))
+        .filter((s): s is Shot => Boolean(s))
+        .map((s, i) => ({ ...s, ordinal: i + 1 }));
+      set({ shots: ordered });
+
+      const args = `"${shotIds.join(',')}"`;
+      try {
+        const r = await call<{ updated: boolean; reason?: string }>(
+          'sprite_reorder_shots',
+          args,
+        );
+        if (!r?.updated) {
+          set({
+            shots: before,
+            error: `reorder failed: ${r?.reason ?? 'unknown'}`,
+          });
+        }
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ shots: before, error: err.message });
+      }
+    },
+
+    startProgressPolling: (intervalMs = 3000) => {
+      if (get().isPolling) return;
+      set({ isPolling: true, pollIntervalMs: intervalMs });
+      const tick = async () => {
+        if (!get().isPolling) return;
+        try {
+          await get().refreshStatus();
+          const phase = get().project?.phase;
+          if (phase === 'done' || phase === 'failed') {
+            // Hydrate the full project once on a terminal phase so the
+            // shot list reflects rendered_video_path and final_video_path
+            // before the UI stops polling.
+            await get().refreshShow();
+            get().stopProgressPolling();
+            return;
+          }
+          // refreshStatus only updates `status`; refreshShow brings shots
+          // up to date so per-shot render_status flips animate live.
+          await get().refreshShow();
+        } catch {
+          // Swallow — transient errors must not kill the polling loop.
+        }
+        setTimeout(tick, get().pollIntervalMs);
+      };
+      void tick();
+    },
+
+    stopProgressPolling: () => set({ isPolling: false }),
+
+    checkAssets: async () => {
+      const up = await checkAssetServer();
+      set({ assetServerUp: up });
+    },
+
+    loadStylePresets: async () => {
+      try {
+        const r = await call<{ presets: StylePreset[]; count: number }>(
+          'sprite_list_styles',
+        );
+        if (r?.presets) set({ stylePresets: r.presets });
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    setStyle: async (presetId) => {
+      const args = `"${presetId.replace(/"/g, '\\"')}"`;
+      try {
+        const r = await call<{ updated: boolean; reason?: string }>(
+          'sprite_set_style',
+          args,
+        );
+        if (!r?.updated) {
+          set({ error: `set_style failed: ${r?.reason ?? 'unknown'}` });
+          return;
+        }
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    setVibe: async (vibe) => {
+      const args = `"${vibe.replace(/"/g, '\\"')}"`;
+      try {
+        const r = await call<{ updated: boolean; reason?: string }>(
+          'sprite_set_vibe',
+          args,
+        );
+        if (!r?.updated) {
+          set({ error: `set_vibe failed: ${r?.reason ?? 'unknown'}` });
+          return;
+        }
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    setDuration: async (seconds) => {
+      try {
+        const r = await call<{ updated: boolean; reason?: string }>(
+          'sprite_set_duration',
+          String(seconds),
+        );
+        if (!r?.updated) {
+          set({ error: `set_duration failed: ${r?.reason ?? 'unknown'}` });
+          return;
+        }
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    reorderCast: async (charIds) => {
+      // Optimistic update — paint the new order immediately, roll back if
+      // the bridge rejects (phase lock, mismatch, network).
+      const before = get().characters;
+      const byId = new Map(before.map((c) => [c.id, c] as const));
+      const ordered = charIds
+        .map((id) => byId.get(id))
+        .filter((c): c is Character => Boolean(c))
+        .map((c, i) => ({ ...c, ordinal: i + 1 }));
+      set({ characters: ordered });
+
+      const args = `"${charIds.join(',')}"`;
+      try {
+        const r = await call<{ updated: boolean; reason?: string }>(
+          'sprite_reorder_cast',
+          args,
+        );
+        if (!r?.updated) {
+          set({
+            characters: before,
+            error: `reorder failed: ${r?.reason ?? 'unknown'}`,
+          });
+        }
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ characters: before, error: err.message });
+      }
+    },
+
+    addCharacter: async (description, refs) => {
+      const quoted = `"${description.replace(/"/g, '\\"')}"`;
+      const args = refs && refs.length > 0
+        ? `${quoted} refs=${refs.join(',')}`
+        : quoted;
+      get().appendChat('user', `/sprite_add_character ${args}`);
+      try {
+        const r = await call<unknown>('sprite_add_character', args);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    editCharacterRefs: async (ordinalOrId, changes, refs) => {
+      const quoted = `"${`${ordinalOrId} | ${changes}`.replace(/"/g, '\\"')}"`;
+      const args = refs.length > 0 ? `${quoted} refs=${refs.join(',')}` : quoted;
+      get().appendChat('user', `/sprite_edit_character ${args}`);
+      try {
+        const r = await call<unknown>('sprite_edit_character', args);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    removeCharacter: async (charIdOrOrdinal) => {
+      const args = `"${String(charIdOrOrdinal)}"`;
+      get().appendChat('user', `/sprite_remove_character ${args}`);
+      try {
+        const r = await call<unknown>('sprite_remove_character', args);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+      }
+    },
+
+    regenerateCharacter: async (ordinalOrId) => {
+      // No dedicated /sprite_regenerate; piggy-back on edit_character with a
+      // catch-all instruction. The orchestrator's decide step will route
+      // into the regenerate path when the user_text doesn't fit a surgical
+      // edit, which "regenerate sheet" reliably triggers.
+      await get().editCharacter(ordinalOrId, 'regenerate sheet');
+    },
+
+    setCharacterField: async (ordinalOrId, field, value) => {
+      // Backend has no /sprite_set_character_field. Only /sprite_edit_character
+      // (NL-translated). The popovers want per-field semantics, so we wrap
+      // editCharacter with a phrasing the orchestrator's decide step routes
+      // into the surgical edit path. "appearance" triggers regenerate.
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      let phrase: string;
+      if (field === 'persona') {
+        phrase = `set persona to: ${trimmed}`;
+      } else if (field === 'visual_description') {
+        phrase = `update visual description: ${trimmed}`;
+      } else {
+        phrase = `regenerate sheet with: ${trimmed}`;
+      }
+      await get().editCharacter(ordinalOrId, phrase);
+    },
+
+    addShot: async (ordinal, action, kvs) => {
+      // /sprite_add_shot expects: "<ordinal> | <action>" or
+      // "<ordinal> | <action> | k1=v1, k2=v2". Backend is phase-locked to
+      // 'timeline' and refreshes the show list on success.
+      let arg = `${ordinal} | ${action}`;
+      if (kvs && Object.keys(kvs).length > 0) {
+        const kvStr = Object.entries(kvs)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(', ');
+        arg += ` | ${kvStr}`;
+      }
+      get().appendChat('user', `/sprite_add_shot "${arg}"`);
+      try {
+        const r = await call<unknown>('sprite_add_shot', arg);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message ?? 'failed to add shot' });
+      }
+    },
+
+    deleteShot: async (shotIdOrOrdinal) => {
+      // /sprite_delete_shot accepts ordinal (1-indexed) or shot id; we send
+      // the id when we have a string that doesn't look like a small int,
+      // since ordinals shift after a delete.
+      const ident = String(shotIdOrOrdinal);
+      get().appendChat('user', `/sprite_delete_shot "${ident}"`);
+      try {
+        const r = await call<unknown>('sprite_delete_shot', ident);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message ?? 'failed to delete shot' });
+      }
+    },
+
+    setShotTransition: async (shotIdOrOrdinal, transition) => {
+      // Dedicated /sprite_set_shot_transition handler validates kind against
+      // VALID_SHOT_TRANSITIONS and updates the column without a regen.
+      const arg = `${shotIdOrOrdinal} | ${transition}`;
+      try {
+        const r = await call<unknown>('sprite_set_shot_transition', arg);
+        // Refresh so the TransitionPill picks up the new label.
+        await get().refreshShow();
+        if (!r) return;
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message ?? 'failed to set transition' });
+      }
+    },
+
+    sendRaw: async (text) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      get().appendChat('user', trimmed);
+      if (!trimmed.startsWith('/')) {
+        get().appendChat(
+          'system',
+          'natural-language chat is not wired (slash-only). try /sprite_status or /sprite_show.',
+        );
+        return;
+      }
+      // Split on first whitespace, preserving the quoted-args convention
+      // the bridge handlers already use (they call _strip_brief_quotes).
+      const stripped = trimmed.slice(1);
+      const m = stripped.match(/^(\S+)\s*(.*)$/s);
+      if (!m) return;
+      const command = m[1];
+      const args = m[2] ?? '';
+      set((s) => ({ chat: { ...s.chat, isStreaming: true } }));
+      try {
+        const r = await call<unknown>(command, args);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        // Refresh project state if the command was state-changing. Cheap to
+        // call /sprite_show even after read-only commands; it just no-ops
+        // the local cache update.
+        await get().refreshShow();
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message });
+        get().appendChat('system', `error: ${err.message}`);
+      } finally {
+        set((s) => ({ chat: { ...s.chat, isStreaming: false } }));
+      }
+    },
+  })),
+);
