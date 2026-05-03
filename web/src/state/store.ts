@@ -6,6 +6,7 @@ import type {
   Character,
   Project,
   ProjectListEntry,
+  ProjectPhase,
   Shot,
   ShotTransition,
   RenderStatusResponse,
@@ -51,6 +52,10 @@ interface AppState {
   isPolling: boolean;
   pollIntervalMs: number;
   popover: PopoverState;
+  // Past-phase navigation (P19a-22). null means follow project.phase (live).
+  // Set to a prior phase to inspect it read-only on a done/failed project.
+  // Reset to null on project switch; backend phase advance does NOT clobber.
+  viewedPhase: ProjectPhase | null;
 
   setActiveProject(id: string | null): void;
   setError(msg: string | null): void;
@@ -58,8 +63,10 @@ interface AppState {
   setDraft(text: string): void;
   openPopover(p: PopoverState): void;
   closePopover(): void;
+  setViewedPhase(phase: ProjectPhase | null): void;
 
   loadProjects(filter?: LobbyFilter): Promise<void>;
+  deleteProject(projectId: string, filter?: LobbyFilter): Promise<void>;
   openProject(projectId: string): Promise<void>;
   newProject(brief: string, opts?: { deferCast?: boolean }): Promise<void>;
   setProjectRefs(paths: string[]): Promise<void>;
@@ -172,11 +179,29 @@ export const useStore = create<AppState>()(
     isPolling: false,
     pollIntervalMs: 3000,
     popover: { kind: 'none' },
+    viewedPhase: null,
 
-    setActiveProject: (id) => set({ activeProjectId: id }),
+    setActiveProject: (id) => set({ activeProjectId: id, viewedPhase: null }),
     setError: (msg) => set({ error: msg }),
     openPopover: (p) => set({ popover: p }),
     closePopover: () => set({ popover: { kind: 'none' } }),
+    setViewedPhase: (phase) => {
+      // Normalize. 'done' / 'failed' are the live terminal states, never a
+      // legitimate past-phase target. Setting either collapses to null
+      // ("go live"). Same for setting null directly, or for setting the
+      // live phase explicitly (e.g. clicking the active node in the strip).
+      const cur = get().project?.phase;
+      if (
+        phase === null
+        || phase === 'done'
+        || phase === 'failed'
+        || phase === cur
+      ) {
+        set({ viewedPhase: null });
+        return;
+      }
+      set({ viewedPhase: phase });
+    },
     appendChat: (role, text) =>
       set((s) => ({
         chat: {
@@ -220,9 +245,35 @@ export const useStore = create<AppState>()(
     },
 
     openProject: async (projectId) => {
-      set({ activeProjectId: projectId });
+      // Reset past-phase navigation when switching projects so the new
+      // project opens at its live phase, not whatever the user last viewed.
+      set({ activeProjectId: projectId, viewedPhase: null });
       await get().refreshShow(projectId);
       await get().refreshStatus(projectId);
+    },
+
+    deleteProject: async (projectId, filter = 'all') => {
+      const client = getSpriteBridge();
+      await client.deleteProject(projectId);
+      // Refetch with the lobby's current filter so the grid stays on the
+      // active tab. The lobby's 10s poll would correct it eventually, but
+      // refreshing here removes the deleted card immediately.
+      await get().loadProjects(filter);
+      // If the user had this project open, drop the active state so the
+      // app doesn't try to render a project whose rows are gone.
+      if (
+        get().activeProjectId === projectId
+        || get().project?.id === projectId
+      ) {
+        set({
+          activeProjectId: null,
+          project: null,
+          characters: [],
+          shots: [],
+          status: null,
+          viewedPhase: null,
+        });
+      }
     },
 
     newProject: async (brief, opts) => {
@@ -762,3 +813,50 @@ export const useStore = create<AppState>()(
     },
   })),
 );
+
+// Past-phase navigation helpers (P19a-22).
+//
+// effectivePhase: phase the UI should render. viewedPhase wins when set,
+// otherwise we follow the live project phase. App.tsx, Header active-pill,
+// and PhaseCanvas children all read this so a click on the strip flips
+// the screen even if the project hasn't moved.
+//
+// canNavigatePast: only done/failed projects support back-navigation.
+// Cancellations stay phase=render (per types/sprite.ts) and remain live.
+//
+// isReadOnlyView: true when the user explicitly stepped back from a
+// terminal phase. Mutating UI (popovers, add/edit/approve, chat send) hides.
+export function selectEffectivePhase(s: AppState): ProjectPhase {
+  return s.viewedPhase ?? s.project?.phase ?? 'brief';
+}
+
+export function selectCanNavigatePast(s: AppState): boolean {
+  const p = s.project?.phase;
+  return p === 'done' || p === 'failed';
+}
+
+export function selectIsReadOnlyView(s: AppState): boolean {
+  if (!selectCanNavigatePast(s)) return false;
+  if (s.viewedPhase === null) return false;
+  return s.viewedPhase !== s.project?.phase;
+}
+
+// Whether a phase node in the strip is reachable for the active project.
+// done projects: every prior phase has data. failed projects: depend on
+// what got generated before the failure (brief always; cast/timeline/render
+// only if the corresponding records exist).
+export function selectIsPhaseReachable(
+  s: AppState,
+  phase: ProjectPhase,
+): boolean {
+  if (!selectCanNavigatePast(s)) return phase === s.project?.phase;
+  if (s.project?.phase === 'done') return true;
+  // failed branch
+  if (phase === 'brief') return true;
+  if (phase === 'cast') return s.characters.length > 0;
+  if (phase === 'timeline') return s.shots.length > 0;
+  if (phase === 'render') {
+    return s.shots.some((x) => Boolean(x.rendered_video_path));
+  }
+  return false; // 'done' on a failed project: never reached
+}

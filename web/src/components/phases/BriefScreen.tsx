@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { JSX, ReactNode } from 'react';
-import { useStore } from '../../state/store';
+import { useStore, selectIsReadOnlyView } from '../../state/store';
 import { PhaseCanvas } from './PhaseCanvas';
 import { StyleSwatch } from '../widgets/StyleSwatch';
 import { presetVisualKey } from '../../lib/styleVisuals';
@@ -64,6 +64,8 @@ export function BriefScreen(): JSX.Element {
   const setDuration = useStore((s) => s.setDuration);
   const setProjectRefs = useStore((s) => s.setProjectRefs);
   const startCast = useStore((s) => s.startCast);
+  const project = useStore((s) => s.project);
+  const readOnly = useStore(selectIsReadOnlyView);
 
   const initial = useState(() => initialFromProject(useStore.getState().project))[0];
   const [text, setText] = useState(initial.text);
@@ -81,6 +83,10 @@ export function BriefScreen(): JSX.Element {
   useEffect(() => {
     if (stylePresets.length === 0) void loadStylePresets();
   }, [stylePresets.length, loadStylePresets]);
+
+  if (readOnly && project) {
+    return <ReadOnlyBrief project={project} stylePresets={stylePresets} />;
+  }
 
   const submit = async () => {
     const trimmed = text.trim();
@@ -489,6 +495,120 @@ export function BriefScreen(): JSX.Element {
         </div>
       </div>
     </PhaseCanvas>
+  );
+}
+
+// Past-phase view of the brief: static recap of text + style/duration/vibe,
+// no inputs, no submit. Mounted by BriefScreen when isReadOnlyView is true.
+function ReadOnlyBrief({
+  project,
+  stylePresets,
+}: {
+  project: Project;
+  stylePresets: StylePreset[];
+}): JSX.Element {
+  const styleName =
+    stylePresets.find((p) => p.id === project.style_preset_id)?.name
+    ?? project.style_preset_id
+    ?? 'auto';
+  return (
+    <PhaseCanvas phase="brief">
+      <div
+        style={{
+          position: 'absolute',
+          inset: 0,
+          display: 'grid',
+          placeItems: 'center',
+          padding: '24px',
+          overflowY: 'auto',
+        }}
+      >
+        <div
+          className="box-hand"
+          style={{
+            width: 'min(680px, calc(100% - 32px))',
+            maxHeight: 'calc(100% - 16px)',
+            overflowY: 'auto',
+            padding: '32px 36px',
+            background: 'var(--paper)',
+            boxSizing: 'border-box',
+          }}
+        >
+          <div
+            className="mono"
+            style={{ fontSize: 9, marginBottom: 10, color: 'var(--ink-faint)' }}
+          >
+            01 · ORIGINAL BRIEF
+          </div>
+          <div
+            className="serif-it"
+            style={{ fontSize: 38, lineHeight: 1, marginBottom: 18 }}
+          >
+            the <span className="underline-hand">scene</span>.
+          </div>
+          <div
+            className="hand"
+            style={{
+              fontSize: 17,
+              lineHeight: 1.45,
+              color: 'var(--ink)',
+              whiteSpace: 'pre-wrap',
+              padding: '12px 14px',
+              border: '1.5px dashed var(--rule-soft)',
+              background: 'var(--paper-tint)',
+              borderRadius: '4px 6px 5px 7px / 6px 5px 7px 4px',
+            }}
+          >
+            {project.brief}
+          </div>
+
+          <div
+            style={{
+              marginTop: 22,
+              display: 'flex',
+              gap: 10,
+              flexWrap: 'wrap',
+            }}
+          >
+            <ReadOnlyTag label="style" value={styleName} />
+            <ReadOnlyTag label="duration" value={`${project.duration_seconds}s`} />
+            {project.vibe && <ReadOnlyTag label="vibe" value={project.vibe} />}
+          </div>
+        </div>
+      </div>
+    </PhaseCanvas>
+  );
+}
+
+function ReadOnlyTag({ label, value }: { label: string; value: string }): JSX.Element {
+  return (
+    <span
+      className="pill"
+      style={{
+        padding: '4px 10px',
+        fontSize: 10,
+        borderStyle: 'solid',
+        borderColor: 'var(--rule-soft)',
+        background: 'var(--paper)',
+        color: 'var(--ink)',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 6,
+      }}
+    >
+      <span
+        style={{
+          color: 'var(--ink-faint)',
+          textTransform: 'uppercase',
+          letterSpacing: 0.5,
+        }}
+      >
+        {label}
+      </span>
+      <span className="hand" style={{ fontSize: 13 }}>
+        {value}
+      </span>
+    </span>
   );
 }
 

@@ -55,6 +55,7 @@ from ..services.errors import (
     FFmpegError,
     FileInvalidError,
     ProviderContentPolicyError,
+    SeedanceAudioSafetyError,
     SpriteStudioError,
 )
 from ..services.ffmpeg_runner import (
@@ -649,6 +650,7 @@ class RenderWorker:
                 detail=f"shot {ord_n} -> seedance",
             ))
 
+            audio_safety_fallback = False
             try:
                 video_path = await self.video.image_to_video(
                     model=self._video_model,
@@ -667,6 +669,50 @@ class RenderWorker:
                 return ShotResult(
                     shot_id=shot_id, ordinal=ord_n, success=False, error=err,
                 )
+            except SeedanceAudioSafetyError as e:
+                logger.warning(
+                    "seedance audio safety filter on shot %d (%s); "
+                    "retrying once with generate_audio=False "
+                    "(narrator track will cover the dialog at stitch time)",
+                    ord_n, e,
+                )
+                # One retry only: if the second attempt also fails the
+                # generic failure path below catches it. The retry submits
+                # a NEW Seedance task (new task_id, new cost); the failed
+                # first attempt's cost is already recorded by image_to_video
+                # via mark_job_failed.
+                try:
+                    video_path = await self.video.image_to_video(
+                        model=self._video_model,
+                        image=Path(ref_path_str),
+                        prompt=prompt,
+                        duration=int(shot["duration_seconds"]),
+                        resolution="720p",
+                        ratio="9:16",
+                        save_to=shot_dir,
+                        project_id=project_id,
+                        generate_audio=False,
+                    )
+                except ProviderContentPolicyError as e2:
+                    err = f"content_policy: {e2.original_message or e2}"
+                    db.update_shot(shot_id, render_status="failed", render_error=err[:500])
+                    return ShotResult(
+                        shot_id=shot_id, ordinal=ord_n, success=False, error=err,
+                    )
+                except SpriteStudioError as e2:
+                    err = f"seedance audio-safety retry: {e2}"
+                    db.update_shot(shot_id, render_status="failed", render_error=err[:500])
+                    logger.warning("shot %d failed: %s", ord_n, err)
+                    return ShotResult(
+                        shot_id=shot_id, ordinal=ord_n, success=False, error=err,
+                    )
+                except OSError as e2:
+                    err = f"disk: {e2}"
+                    db.update_shot(shot_id, render_status="failed", render_error=err[:500])
+                    return ShotResult(
+                        shot_id=shot_id, ordinal=ord_n, success=False, error=err,
+                    )
+                audio_safety_fallback = True
             except SpriteStudioError as e:
                 err = f"seedance: {e}"
                 db.update_shot(shot_id, render_status="failed", render_error=err[:500])
@@ -702,6 +748,7 @@ class RenderWorker:
                 render_status="done",
                 cost_usd=cost_delta,
                 render_error=None,
+                audio_safety_fallback=1 if audio_safety_fallback else 0,
             )
 
             await PROGRESS_BUS.emit(ProgressEvent(

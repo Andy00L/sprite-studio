@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -21,10 +22,22 @@ except Exception:
         return f"{time.time_ns():016x}{secrets.token_hex(5)}".upper()
 
 
+# Crockford base32: 0-9 plus A-Z minus I, L, O, U. ULIDs are exactly 26 chars.
+# Used as the path-traversal guard wherever a project_id flows into an FS or
+# destructive DB operation: rejecting "../etc/passwd" or "01KQ/..." keeps
+# delete_project_cascade and the bridge DELETE route from touching anything
+# outside the projects/<ulid>/ tree.
+_ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
+
+
+def _is_valid_ulid(s: Any) -> bool:
+    return isinstance(s, str) and bool(_ULID_RE.match(s))
+
+
 logger = logging.getLogger("sprite_studio.db")
 
 DB_PATH = Path("~/.hermes/plugins/sprite-studio/state.db").expanduser()
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 VALID_SHOT_TRANSITIONS = ("cut", "fade", "dissolve", "match_cut")
 
@@ -75,7 +88,7 @@ _SHOT_COLUMNS = {
     "emotion", "characters_present", "narration_line", "character_dialog",
     "dialog_speakers", "has_dialog", "transition_to_next",
     "reference_still_path", "rendered_video_path", "render_status",
-    "render_error", "cost_usd",
+    "render_error", "cost_usd", "audio_safety_fallback",
 }
 
 _PROJECT_JSON_COLUMNS: set[str] = {"ref_image_paths"}
@@ -154,6 +167,8 @@ CREATE TABLE IF NOT EXISTS shots (
     CHECK (render_status IN ('pending','rendering','done','failed')),
   render_error TEXT,
   cost_usd REAL NOT NULL DEFAULT 0 CHECK (cost_usd >= 0),
+  audio_safety_fallback INTEGER NOT NULL DEFAULT 0
+    CHECK (audio_safety_fallback IN (0,1)),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE (project_id, ordinal)
@@ -345,6 +360,26 @@ def _migration_v5_cast_size_confirmed(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migration_v6_audio_safety_fallback(conn: sqlite3.Connection) -> None:
+    """v5 to v6: add audio_safety_fallback to shots.
+
+    Idempotent: guarded by a PRAGMA table_info check. Default 0 reflects
+    the historical record (no shot has been rescued yet on existing rows).
+    Set to 1 by render_worker when a shot succeeds on its second attempt
+    after Seedance refused the first attempt's audio with code
+    OutputAudioSensitiveContentDetected.
+    """
+    shots_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(shots)").fetchall()
+    }
+    if "audio_safety_fallback" not in shots_cols:
+        conn.execute(
+            "ALTER TABLE shots "
+            "ADD COLUMN audio_safety_fallback INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (audio_safety_fallback IN (0,1))",
+        )
+
+
 def _migration_v3_shot_transitions(conn: sqlite3.Connection) -> None:
     """v2 → v3: add transition_to_next to shots.
 
@@ -389,6 +424,8 @@ def _migrate() -> None:
                 _migration_v4_project_refs(conn)
             if before < 5:
                 _migration_v5_cast_size_confirmed(conn)
+            if before < 6:
+                _migration_v6_audio_safety_fallback(conn)
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -603,6 +640,57 @@ def delete_project(project_id: str, *, keep_final_video: bool = False) -> dict:
         },
         "filesystem_removed": fs_removed,
         "final_video_kept_at": fs_kept,
+    }
+
+
+def delete_project_cascade(project_id: str) -> dict:
+    """ULID-validated, DB-only cascade delete.
+
+    Mirrors delete_project's row order (jobs -> shots -> characters -> project)
+    but skips the filesystem cleanup so the orchestrator can sequence FS
+    teardown around in-flight task cancellation. The ULID guard runs BEFORE
+    any SQL so a malformed project_id (path traversal attempt, empty string,
+    lowercase, wrong length) never reaches the WHERE clause.
+
+    Raises ValueError if project_id is not a valid ULID.
+    Raises ProjectNotFoundError if no row matches.
+    """
+    if not _is_valid_ulid(project_id):
+        raise ValueError(f"invalid project_id: {project_id!r}")
+
+    project = get_project(project_id)
+    if project is None:
+        raise ProjectNotFoundError(f"project not found: {project_id}")
+
+    with txn() as conn:
+        n_jobs = _execute_with_retry(
+            conn, "DELETE FROM generation_jobs WHERE project_id = ?",
+            (project_id,),
+        ).rowcount
+        n_shots = _execute_with_retry(
+            conn, "DELETE FROM shots WHERE project_id = ?",
+            (project_id,),
+        ).rowcount
+        n_chars = _execute_with_retry(
+            conn, "DELETE FROM characters WHERE project_id = ?",
+            (project_id,),
+        ).rowcount
+        _execute_with_retry(
+            conn, "DELETE FROM projects WHERE id = ?", (project_id,),
+        )
+
+    logger.info(
+        "delete_project_cascade pid=%s jobs=%d shots=%d chars=%d",
+        project_id, n_jobs, n_shots, n_chars,
+    )
+    return {
+        "deleted": True,
+        "project_id": project_id,
+        "rows_removed": {
+            "jobs": n_jobs,
+            "shots": n_shots,
+            "characters": n_chars,
+        },
     }
 
 

@@ -19,6 +19,7 @@ provides_commands:
   - sprite_cancel
   - sprite_show
   - sprite_purge
+  - sprite_delete_project
   - sprite_list
   - sprite_cost_summary
   - sprite_list_styles

@@ -21,7 +21,7 @@ import { CSS } from '@dnd-kit/utilities';
 // dnd-kit sortable docs: https://docs.dndkit.com/presets/sortable
 // React 19 ref-as-prop: https://react.dev/blog/2024/12/05/react-19
 
-import { useStore } from '../../state/store';
+import { useStore, selectIsReadOnlyView } from '../../state/store';
 import { PhaseCanvas } from './PhaseCanvas';
 import { CharacterAnchor } from '../timeline/CharacterAnchor';
 import { ShotCard } from '../timeline/ShotCard';
@@ -54,6 +54,7 @@ export function TimelineScreen(): JSX.Element {
   const openPopover = useStore((s) => s.openPopover);
   const refreshShow = useStore((s) => s.refreshShow);
   const generateTimeline = useStore((s) => s.generateTimeline);
+  const readOnly = useStore(selectIsReadOnlyView);
 
   const projectId = project?.id ?? '';
   const timelineStatus = project?.timeline_status ?? (shots.length > 0 ? 'ready' : 'generating');
@@ -114,6 +115,7 @@ export function TimelineScreen(): JSX.Element {
   );
 
   const onShotDragEnd = (e: DragEndEvent) => {
+    if (readOnly) return;
     const { active, over } = e;
     if (!over || active.id === over.id) return;
     const oldIdx = shots.findIndex((s) => s.id === active.id);
@@ -124,6 +126,7 @@ export function TimelineScreen(): JSX.Element {
   };
 
   const onCharDragEnd = (e: DragEndEvent) => {
+    if (readOnly) return;
     const { active, over } = e;
     if (!over || active.id === over.id) return;
     const oldIdx = characters.findIndex((c) => c.id === active.id);
@@ -134,7 +137,23 @@ export function TimelineScreen(): JSX.Element {
   };
 
   const onAddShot = (): void => {
+    if (readOnly) return;
     openPopover({ kind: 'shot-add', insertAfterOrdinal: shots.length });
+  };
+
+  const onShotClick = (shotId: string): void => {
+    if (readOnly) return;
+    openPopover({ kind: 'shot-edit', shotId });
+  };
+
+  const onCharClick = (charId: string): void => {
+    if (readOnly) return;
+    openPopover({ kind: 'character-edit', characterId: charId });
+  };
+
+  const onTransitionClick = (shotId: string): void => {
+    if (readOnly) return;
+    openPopover({ kind: 'transition', shotId });
   };
 
   return (
@@ -161,34 +180,35 @@ export function TimelineScreen(): JSX.Element {
                 key={c.id}
                 character={c}
                 projectId={projectId}
-                onClick={() =>
-                  openPopover({ kind: 'character-edit', characterId: c.id })
-                }
+                onClick={() => onCharClick(c.id)}
+                disabled={readOnly}
                 setRef={(el) => {
                   charRefs.current[c.id] = el;
                 }}
               />
             ))}
-            <div
-              className="box-soft pressy"
-              onClick={() => openPopover({ kind: 'character-add' })}
-              style={{
-                padding: 16,
-                color: 'var(--accent)',
-                textAlign: 'center',
-                alignSelf: 'stretch',
-                display: 'grid',
-                placeItems: 'center',
-                minWidth: 130,
-                cursor: 'pointer',
-              }}
-            >
-              <span className="serif-it" style={{ fontSize: 18 }}>
-                {'+ add'}
-                <br />
-                {'character'}
-              </span>
-            </div>
+            {!readOnly && (
+              <div
+                className="box-soft pressy"
+                onClick={() => openPopover({ kind: 'character-add' })}
+                style={{
+                  padding: 16,
+                  color: 'var(--accent)',
+                  textAlign: 'center',
+                  alignSelf: 'stretch',
+                  display: 'grid',
+                  placeItems: 'center',
+                  minWidth: 130,
+                  cursor: 'pointer',
+                }}
+              >
+                <span className="serif-it" style={{ fontSize: 18 }}>
+                  {'+ add'}
+                  <br />
+                  {'character'}
+                </span>
+              </div>
+            )}
           </div>
         </SortableContext>
       </DndContext>
@@ -253,9 +273,8 @@ export function TimelineScreen(): JSX.Element {
                       ordinal={i + 1}
                       characters={characters}
                       projectId={projectId}
-                      onClick={() =>
-                        openPopover({ kind: 'shot-edit', shotId: s.id })
-                      }
+                      onClick={() => onShotClick(s.id)}
+                      disabled={readOnly}
                       setRef={(el) => {
                         shotRefs.current[s.id] = el;
                       }}
@@ -277,14 +296,13 @@ export function TimelineScreen(): JSX.Element {
                       >
                         <TransitionPill
                           current={s.transition_to_next}
-                          onClick={() =>
-                            openPopover({ kind: 'transition', shotId: s.id })
-                          }
+                          onClick={() => onTransitionClick(s.id)}
+                          readOnly={readOnly}
                         />
                       </div>
                     );
                   })}
-                  {placed.length > 0 && (() => {
+                  {!readOnly && placed.length > 0 && (() => {
                     const last = placed[placed.length - 1];
                     const ax = last.x + last.w + SHOT_GAP;
                     return (
@@ -405,17 +423,28 @@ interface SortableCharProps {
   projectId: string;
   onClick: () => void;
   setRef: (el: HTMLElement | null) => void;
+  disabled?: boolean;
 }
 
-function SortableCharacter({ character, projectId, onClick, setRef }: SortableCharProps): JSX.Element {
+function SortableCharacter({
+  character,
+  projectId,
+  onClick,
+  setRef,
+  disabled = false,
+}: SortableCharProps): JSX.Element {
+  // dnd-kit's useSortable accepts `disabled` to suppress drag listeners
+  // entirely (https://docs.dndkit.com/presets/sortable/usesortable). Past-
+  // phase navigation passes disabled=true so the order can't shift.
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: character.id,
+    disabled,
   });
   const style: CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.55 : 1,
-    cursor: 'grab',
+    cursor: disabled ? 'default' : 'grab',
   };
   const mergedRef = (el: HTMLDivElement | null) => {
     setNodeRef(el);
@@ -423,7 +452,11 @@ function SortableCharacter({ character, projectId, onClick, setRef }: SortableCh
   };
   return (
     <div ref={mergedRef} style={style} {...attributes} {...listeners}>
-      <CharacterAnchor character={character} projectId={projectId} onClick={onClick} />
+      <CharacterAnchor
+        character={character}
+        projectId={projectId}
+        onClick={disabled ? () => undefined : onClick}
+      />
     </div>
   );
 }
@@ -435,6 +468,7 @@ interface SortableShotProps {
   projectId: string;
   onClick: () => void;
   setRef: (el: HTMLElement | null) => void;
+  disabled?: boolean;
 }
 
 function SortableShot({
@@ -444,9 +478,11 @@ function SortableShot({
   projectId,
   onClick,
   setRef,
+  disabled = false,
 }: SortableShotProps): JSX.Element {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: placed.id,
+    disabled,
   });
   const style: CSSProperties = {
     position: 'absolute',
@@ -471,7 +507,8 @@ function SortableShot({
         height={CARD_H}
         characters={characters}
         projectId={projectId}
-        onClick={onClick}
+        onClick={disabled ? () => undefined : onClick}
+        readOnly={disabled}
       />
     </div>
   );

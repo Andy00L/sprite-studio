@@ -21,9 +21,12 @@ export function CharacterCard({
   const hasReal = Boolean(character.master_sheet_path);
   const sheetSize = compact ? 56 : 64;
   const persona = character.persona ?? '';
+  // Read-only mounts pass onClick=undefined; the pressy class baseline cursor
+  // would otherwise still say "pointer" on a card that does nothing.
+  const interactive = Boolean(onClick);
   return (
     <div
-      className="box-hand pressy"
+      className={interactive ? 'box-hand pressy' : 'box-hand'}
       onClick={onClick}
       style={{
         padding: compact ? 10 : 12,
@@ -31,6 +34,7 @@ export function CharacterCard({
         gap: 10,
         background: 'var(--paper)',
         width: compact ? 200 : 220,
+        cursor: interactive ? undefined : 'default',
       }}
     >
       {hasReal ? (

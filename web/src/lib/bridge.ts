@@ -45,6 +45,37 @@ export class SpriteBridgeClient {
     return resp.json();
   }
 
+  async deleteProject(projectId: string): Promise<{ freed_bytes: number }> {
+    const resp = await fetch(`${this.baseUrl}/projects/${projectId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+    });
+    // 404 means already gone. Idempotent success path so a double-click on
+    // the trash button doesn't surface a phantom error.
+    if (resp.status === 404) return { freed_bytes: 0 };
+    if (resp.status === 401 || resp.status === 403) {
+      throw { status: resp.status, message: 'Invalid API key' } as BridgeError;
+    }
+    if (resp.status === 409) {
+      const body = (await resp.json().catch(() => ({}))) as { reason?: string };
+      throw {
+        status: 409,
+        message: `project busy: ${body.reason ?? 'unknown'}`,
+      } as BridgeError;
+    }
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw {
+        status: resp.status,
+        message: `delete failed (${resp.status}): ${text.slice(0, 300)}`,
+      } as BridgeError;
+    }
+    const body = (await resp.json().catch(() => ({}))) as {
+      freed_bytes?: number;
+    };
+    return { freed_bytes: body.freed_bytes ?? 0 };
+  }
+
   async sendSlash<T = unknown>(command: string, args = ''): Promise<SlashResult<T>> {
     const cleanCommand = command.replace(/^\//, '').trim();
     if (!cleanCommand) {

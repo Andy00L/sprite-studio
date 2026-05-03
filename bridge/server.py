@@ -476,6 +476,51 @@ def make_app(plugin: types.ModuleType, api_key: str) -> web.Application:
                 {"ok": False, "data": None, "raw": raw, "parseError": str(exc)}
             )
 
+    async def delete_project_route(request: web.Request) -> web.Response:
+        """DELETE /projects/{project_id}.
+
+        REST sibling to the /sprite_delete_project slash command, used by the
+        web lobby's per-card trash button. Same auth as /slash (Bearer). ULID
+        is validated here in addition to the cascade layer (defense in depth)
+        so a malformed id never reaches the orchestrator.
+        """
+        if (err := _check_auth(request, api_key)) is not None:
+            return err
+
+        pid = request.match_info["project_id"]
+        # Inline ULID guard. Duplicates db._is_valid_ulid on purpose so the
+        # bridge can reject malformed ids without importing the plugin in
+        # this hot path. Crockford base32, exactly 26 chars.
+        import re as _re
+        if not _re.match(r"^[0-9A-HJKMNP-TV-Z]{26}$", pid):
+            return web.json_response(
+                {"error": "invalid_project_id", "id": pid}, status=400,
+            )
+
+        try:
+            orchestrator = plugin.commands._get_orchestrator()
+            result = await orchestrator.delete_project(pid)
+            return web.json_response(result, status=200)
+        except plugin.db.ProjectNotFoundError:
+            return web.json_response(
+                {"error": "not_found", "id": pid}, status=404,
+            )
+        except plugin.orchestrator.ProjectBusyError as e:
+            return web.json_response(
+                {"error": "busy", "reason": e.reason, "id": pid},
+                status=409,
+            )
+        except ValueError as e:
+            return web.json_response(
+                {"error": "invalid_project_id", "id": pid, "detail": str(e)},
+                status=400,
+            )
+        except Exception as e:
+            logger.exception("delete_project failed pid=%s", pid)
+            return web.json_response(
+                {"error": "internal", "detail": str(e)}, status=500,
+            )
+
     app = web.Application()
     # Stash the bridge's Bearer key on the app dict so the asset server
     # startup hook (which runs in the same process) can forward it to the
@@ -483,6 +528,7 @@ def make_app(plugin: types.ModuleType, api_key: str) -> web.Application:
     app["api_key"] = api_key
     app.router.add_get("/health", health)
     app.router.add_post("/slash", slash)
+    app.router.add_delete("/projects/{project_id}", delete_project_route)
     app.on_startup.append(_start_asset_server)
     app.on_cleanup.append(_stop_asset_server)
     return app

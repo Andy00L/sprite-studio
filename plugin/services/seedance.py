@@ -69,6 +69,8 @@ from .errors import (
     ProviderResponseShapeError,
     ProviderServerError,
     ProviderTimeoutError,
+    SeedanceAudioSafetyError,
+    SeedanceTaskFailedError,
     SpriteStudioError,
 )
 
@@ -466,16 +468,48 @@ class VideoClient:
                     "raw": body,
                 }
             if status == "FAILURE":
-                msg = (
-                    body.get("message")
-                    or (data.get("data") or {}).get("error")
-                    or "seedance task failed"
-                )
+                err_obj = self._extract_failure_object(body)
+                err_code = ""
+                err_msg = ""
+                if isinstance(err_obj, dict):
+                    err_code = (err_obj.get("code") or "").strip()
+                    err_msg = (err_obj.get("message") or "").strip()
+                if not err_msg and isinstance(body, dict):
+                    top_msg = body.get("message")
+                    if isinstance(top_msg, str):
+                        err_msg = top_msg
+                if not err_msg:
+                    err_msg = (
+                        str(err_obj) if err_obj is not None
+                        else "seedance task failed"
+                    )
+
                 if job_row_id:
-                    db.mark_job_failed(job_row_id, str(msg)[:500])
-                raise ProviderServerError(
-                    f"seedance task failed: {msg}",
+                    db.mark_job_failed(job_row_id, str(err_msg)[:500])
+
+                # OutputAudioSensitiveContentDetected fires on the audio
+                # track only; the visuals are fine. Raise a typed error so
+                # the caller can retry once with audio off and recover the
+                # shot. See workers/render_worker.py for the retry path.
+                if err_code == "OutputAudioSensitiveContentDetected":
+                    raise SeedanceAudioSafetyError(
+                        f"seedance audio safety filter: {err_msg}",
+                        provider="tokenrouter",
+                        extra={
+                            "task_id": task_id,
+                            "code": err_code,
+                            "vendor_message": err_msg,
+                        },
+                    )
+
+                raise SeedanceTaskFailedError(
+                    f"seedance task failed: {err_msg}",
                     provider="tokenrouter",
+                    extra={
+                        "task_id": task_id,
+                        "code": err_code or None,
+                        "vendor_message": err_msg,
+                    },
                 )
             # QUEUED / SUBMITTED / IN_PROGRESS - keep polling.
             await asyncio.sleep(poll_interval)
@@ -698,6 +732,33 @@ class VideoClient:
             final_audio, audio_reason,
         )
         return dest
+
+    @staticmethod
+    def _extract_failure_object(body: Any) -> Any:
+        """Find the {code, message} failure dict in a poll FAILURE response.
+
+        Live shape on the Hippo Incident render had the failure dict at
+        body.data.data.error (matching how billed-token usage lives at
+        body.data.data.usage on SUCCESS). Tolerate body.data.error and
+        body.error too so a future vendor envelope shift cannot silently
+        send us back to the generic-failure path.
+        """
+        if not isinstance(body, dict):
+            return None
+        outer = body.get("data")
+        if isinstance(outer, dict):
+            inner = outer.get("data")
+            if isinstance(inner, dict):
+                err = inner.get("error")
+                if isinstance(err, dict):
+                    return err
+            err = outer.get("error")
+            if isinstance(err, dict):
+                return err
+        err = body.get("error")
+        if isinstance(err, dict):
+            return err
+        return None
 
     @staticmethod
     def _extract_billed_tokens(raw: Any) -> int | None:

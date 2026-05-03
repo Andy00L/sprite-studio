@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { JSX, KeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
-import { useStore } from '../../state/store';
+import { useStore, selectIsReadOnlyView } from '../../state/store';
 
 const ROLE_GLYPH = {
   user: '›',
@@ -30,6 +30,11 @@ export function ChatDock(): JSX.Element {
   const setDraft = useStore((s) => s.setDraft);
   const sendRaw = useStore((s) => s.sendRaw);
   const isStreaming = useStore((s) => s.chat.isStreaming);
+  // Past-phase navigation: input + history stay visible so users can read
+  // what was sent in earlier phases, but Enter is swallowed and the status
+  // pill flips to "read-only". Backend would reject mutations anyway via
+  // its phase-state-machine guard; this is the visible signal.
+  const readOnly = useStore(selectIsReadOnlyView);
 
   const [height, setHeight] = useState<number>(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -77,6 +82,7 @@ export function ChatDock(): JSX.Element {
   }, [messages.length]);
 
   const submit = () => {
+    if (readOnly) return;
     const text = draft.trim();
     if (!text) return;
     setDraft('');
@@ -140,13 +146,23 @@ export function ChatDock(): JSX.Element {
         <span>·</span>
         <span>/commands</span>
         <span>·</span>
-        <span style={{ color: isStreaming ? 'var(--accent)' : 'var(--good)' }}>
-          {isStreaming ? '○ working' : '● ready'}
+        <span
+          style={{
+            color: readOnly
+              ? 'var(--accent)'
+              : isStreaming
+                ? 'var(--accent)'
+                : 'var(--good)',
+          }}
+        >
+          {readOnly ? '◷ read-only' : isStreaming ? '○ working' : '● ready'}
         </span>
         <span>·</span>
         <span>8643</span>
         <span style={{ flex: 1 }} />
-        <span>↵ send</span>
+        <span style={{ color: readOnly ? 'var(--accent)' : undefined }}>
+          {readOnly ? 'send blocked' : '↵ send'}
+        </span>
       </div>
       <div
         ref={listRef}
@@ -207,10 +223,14 @@ export function ChatDock(): JSX.Element {
         <input
           type="text"
           value={draft}
-          placeholder="type a slash command, or describe an edit…"
+          placeholder={
+            readOnly
+              ? 'read-only past phase. click "done" to send commands.'
+              : 'type a slash command, or describe an edit…'
+          }
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={handleKey}
-          disabled={isStreaming}
+          disabled={isStreaming || readOnly}
           style={{
             flex: 1,
             fontFamily: 'var(--hand)',

@@ -110,6 +110,7 @@ class Shot(BaseModel):
     render_status: Literal["pending", "rendering", "done", "failed"] = "pending"
     render_error: Optional[str] = None
     cost_usd: float = Field(ge=0, default=0.0)
+    audio_safety_fallback: bool = False
     created_at: int
     updated_at: int
 
@@ -166,6 +167,8 @@ def row_to_model(row: Any, model_cls: type[BaseModel]) -> BaseModel:
         data["is_approved"] = bool(data["is_approved"])
     if model_cls is Shot and isinstance(data.get("has_dialog"), int):
         data["has_dialog"] = bool(data["has_dialog"])
+    if model_cls is Shot and isinstance(data.get("audio_safety_fallback"), int):
+        data["audio_safety_fallback"] = bool(data["audio_safety_fallback"])
     if model_cls is Project and isinstance(data.get("use_narrator"), int):
         data["use_narrator"] = bool(data["use_narrator"])
     if model_cls is Project and isinstance(data.get("cast_size_confirmed"), int):

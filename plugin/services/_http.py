@@ -25,6 +25,21 @@ HTTP_TOTAL_CHAT = 240.0
 HTTP_READ_IMAGE = 240.0
 HTTP_TOTAL_IMAGE = 300.0
 
+# Per-request Timeout objects exposed for callers that need to override
+# the shared AsyncClient default. The shared client default below is left
+# unchanged so unrelated call paths are not affected.
+#
+# DEFAULT_TIMEOUT: routine HTTP calls (image gen submit/poll, seedance
+# poll/download, elevenlabs synthesize) where vendor-side latency is
+# bounded.
+# LLM_TIMEOUT: chat completions where Kimi K2.6 reasoning latency is the
+# bottleneck. Live evidence: 5-character timeline writer call exceeded
+# the prior 300s ceiling on the Hippo Incident render. 600s gives ~3x
+# headroom over the observed worst case without letting a stuck call
+# hang for many minutes.
+DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
+LLM_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
+
 USER_AGENT = "sprite-studio/0.1.0 (+hermes plugin)"
 
 _client: Optional[httpx.AsyncClient] = None

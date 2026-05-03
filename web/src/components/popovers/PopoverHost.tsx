@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import type { JSX } from 'react';
-import { useStore } from '../../state/store';
+import { useStore, selectIsReadOnlyView } from '../../state/store';
 import { CharacterEditPopover } from './CharacterEditPopover';
 import { CharacterAddPopover } from './CharacterAddPopover';
 import { ShotEditPopover } from './ShotEditPopover';
@@ -12,6 +12,7 @@ export function PopoverHost(): JSX.Element | null {
   const shots = useStore((s) => s.shots);
   const closePopover = useStore((s) => s.closePopover);
   const phase = useStore((s) => s.project?.phase);
+  const readOnly = useStore(selectIsReadOnlyView);
 
   // Close any open popover if the phase changes underneath it (e.g. a chat
   // command advances the project from cast → timeline). Stale popovers
@@ -19,6 +20,14 @@ export function PopoverHost(): JSX.Element | null {
   useEffect(() => {
     closePopover();
   }, [phase, closePopover]);
+
+  // Past-phase navigation (P19a-22): when the user steps back into a
+  // read-only view, swallow any popover that was queued by a stale onClick
+  // and refuse to mount new ones. Defense in depth: screens also avoid
+  // wiring click handlers in read-only mode.
+  useEffect(() => {
+    if (readOnly && popover.kind !== 'none') closePopover();
+  }, [readOnly, popover.kind, closePopover]);
 
   // ESC closes the popover globally; document listener wins over
   // per-input focus state.
@@ -31,6 +40,7 @@ export function PopoverHost(): JSX.Element | null {
     return () => document.removeEventListener('keydown', onKey);
   }, [popover.kind, closePopover]);
 
+  if (readOnly) return null;
   if (popover.kind === 'none') return null;
 
   if (popover.kind === 'character-edit') {

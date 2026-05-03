@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import type { JSX } from 'react';
-import { useStore } from '../../state/store';
+import { useStore, selectIsReadOnlyView } from '../../state/store';
 import { PhaseCanvas } from './PhaseCanvas';
 import { ShotStill } from '../sprites/ShotStill';
 import { kindForShot } from '../../lib/design';
@@ -20,11 +20,15 @@ export function RenderScreen(): JSX.Element {
   const startProgressPolling = useStore((s) => s.startProgressPolling);
   const stopProgressPolling = useStore((s) => s.stopProgressPolling);
   const cancelRender = useStore((s) => s.cancelRender);
+  const readOnly = useStore(selectIsReadOnlyView);
 
   useEffect(() => {
+    // Past-phase view is a snapshot; polling would burn cycles for nothing
+    // and could re-hydrate the screen with stale data mid-inspection.
+    if (readOnly) return;
     startProgressPolling(3000);
     return () => stopProgressPolling();
-  }, [startProgressPolling, stopProgressPolling]);
+  }, [readOnly, startProgressPolling, stopProgressPolling]);
 
   if (!project) {
     return (
@@ -67,11 +71,20 @@ export function RenderScreen(): JSX.Element {
             }}
           >
             <h1 className="serif-it" style={{ fontSize: 48, margin: 0, lineHeight: 1 }}>
-              {'rendering'}
-              <span className="accent">…</span>
+              {readOnly ? 'render snapshot' : 'rendering'}
+              <span className="accent">{readOnly ? '.' : '…'}</span>
             </h1>
-            <span className="pill pill-accent">{`○ ${stage}`}</span>
-            {eta != null && <span className="pill">{`ETA ${fmtEta(eta)}`}</span>}
+            {!readOnly && (
+              <>
+                <span className="pill pill-accent">{`○ ${stage}`}</span>
+                {eta != null && <span className="pill">{`ETA ${fmtEta(eta)}`}</span>}
+              </>
+            )}
+            {readOnly && (
+              <span className="pill" style={{ borderStyle: 'solid' }}>
+                {`${doneShots}/${totalShots} shots · final`}
+              </span>
+            )}
           </div>
 
           {totalShots === 0 ? (
@@ -228,7 +241,7 @@ export function RenderScreen(): JSX.Element {
             </div>
           )}
 
-          {detail && (
+          {detail && !readOnly && (
             <div
               className="hand"
               style={{ fontSize: 14, color: 'var(--ink-soft)', marginTop: 14 }}
@@ -237,24 +250,26 @@ export function RenderScreen(): JSX.Element {
             </div>
           )}
 
-          <div
-            className="box-hand"
-            style={{ marginTop: 20, padding: 12, fontFamily: 'var(--mono)', fontSize: 10 }}
-          >
+          {!readOnly && (
             <div
-              style={{
-                fontSize: 9,
-                color: 'var(--ink-faint)',
-                marginBottom: 6,
-                letterSpacing: '0.12em',
-              }}
+              className="box-hand"
+              style={{ marginTop: 20, padding: 12, fontFamily: 'var(--mono)', fontSize: 10 }}
             >
-              LIVE LOG
+              <div
+                style={{
+                  fontSize: 9,
+                  color: 'var(--ink-faint)',
+                  marginBottom: 6,
+                  letterSpacing: '0.12em',
+                }}
+              >
+                LIVE LOG
+              </div>
+              <div style={{ lineHeight: 1.5, color: 'var(--ink-soft)' }}>
+                <LogLines stage={stage} detail={detail} doneShots={doneShots} totalShots={totalShots} />
+              </div>
             </div>
-            <div style={{ lineHeight: 1.5, color: 'var(--ink-soft)' }}>
-              <LogLines stage={stage} detail={detail} doneShots={doneShots} totalShots={totalShots} />
-            </div>
-          </div>
+          )}
         </div>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -263,8 +278,8 @@ export function RenderScreen(): JSX.Element {
               STATUS
             </div>
             <div className="serif-it" style={{ fontSize: 28, color: 'var(--accent)' }}>
-              <span className="pulsing-dot" style={{ marginRight: 8 }} />
-              {stage}
+              {!readOnly && <span className="pulsing-dot" style={{ marginRight: 8 }} />}
+              {readOnly ? (project.phase === 'failed' ? 'failed' : 'done') : stage}
             </div>
           </div>
 
@@ -298,22 +313,24 @@ export function RenderScreen(): JSX.Element {
             </div>
           </div>
 
-          <button
-            className="cta cta-ghost"
-            onClick={() => void cancelRender()}
-            style={{ padding: '10px 14px' }}
-          >
-            ✕ cancel
-          </button>
+          {!readOnly && (
+            <button
+              className="cta cta-ghost"
+              onClick={() => void cancelRender()}
+              style={{ padding: '10px 14px' }}
+            >
+              ✕ cancel
+            </button>
+          )}
 
           <div className="box-hand" style={{ padding: 14 }}>
             <div className="mono" style={{ fontSize: 9, marginBottom: 4 }}>
-              cost · live
+              {readOnly ? 'cost · final' : 'cost · live'}
             </div>
             <div className="serif-it" style={{ fontSize: 32, lineHeight: 1 }}>
               {`$${cost.toFixed(2)}`}
             </div>
-            {eta != null && (
+            {!readOnly && eta != null && (
               <div
                 className="mono"
                 style={{ fontSize: 9, color: 'var(--ink-faint)', marginTop: 4 }}
@@ -323,11 +340,13 @@ export function RenderScreen(): JSX.Element {
             )}
           </div>
 
-          <div className="sticky-note">
-            tip: cancel keeps shots already done.
-            <br />
-            re-run /sprite_render to resume.
-          </div>
+          {!readOnly && (
+            <div className="sticky-note">
+              tip: cancel keeps shots already done.
+              <br />
+              re-run /sprite_render to resume.
+            </div>
+          )}
         </div>
       </div>
     </PhaseCanvas>

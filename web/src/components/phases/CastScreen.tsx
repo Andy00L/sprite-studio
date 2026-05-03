@@ -1,5 +1,5 @@
 import type { JSX } from 'react';
-import { useStore } from '../../state/store';
+import { useStore, selectIsReadOnlyView } from '../../state/store';
 import { PhaseCanvas } from './PhaseCanvas';
 import { CharacterCard } from '../chrome/CharacterCard';
 
@@ -7,6 +7,7 @@ export function CastScreen(): JSX.Element {
   const characters = useStore((s) => s.characters);
   const project = useStore((s) => s.project);
   const openPopover = useStore((s) => s.openPopover);
+  const readOnly = useStore(selectIsReadOnlyView);
 
   const projectId = project?.id ?? '';
 
@@ -33,29 +34,33 @@ export function CastScreen(): JSX.Element {
             key={c.id}
             character={c}
             projectId={projectId}
-            onClick={() =>
-              openPopover({ kind: 'character-edit', characterId: c.id })
+            onClick={
+              readOnly
+                ? undefined
+                : () => openPopover({ kind: 'character-edit', characterId: c.id })
             }
           />
         ))}
-        <div
-          className="box-soft pressy"
-          onClick={() => openPopover({ kind: 'character-add' })}
-          style={{
-            width: 160,
-            display: 'grid',
-            placeItems: 'center',
-            padding: 16,
-            color: 'var(--ink-faint)',
-            textAlign: 'center',
-            minHeight: 140,
-            cursor: 'pointer',
-          }}
-        >
-          <div className="serif-it" style={{ fontSize: 22, color: 'var(--accent)' }}>
-            + add character
+        {!readOnly && (
+          <div
+            className="box-soft pressy"
+            onClick={() => openPopover({ kind: 'character-add' })}
+            style={{
+              width: 160,
+              display: 'grid',
+              placeItems: 'center',
+              padding: 16,
+              color: 'var(--ink-faint)',
+              textAlign: 'center',
+              minHeight: 140,
+              cursor: 'pointer',
+            }}
+          >
+            <div className="serif-it" style={{ fontSize: 22, color: 'var(--accent)' }}>
+              + add character
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       <div
@@ -68,7 +73,15 @@ export function CastScreen(): JSX.Element {
           maxWidth: 600,
         }}
       >
-        {characters.length === 0 ? (
+        {readOnly ? (
+          <div
+            className="hand"
+            style={{ fontSize: 14, color: 'var(--ink-faint)' }}
+          >
+            {characters.length} cast member{characters.length === 1 ? '' : 's'} ·
+            this is the snapshot at the time of render.
+          </div>
+        ) : characters.length === 0 ? (
           <div className="sticky-note" style={{ display: 'inline-block', maxWidth: 420 }}>
             cast generation in progress. check the chat below for status; when characters appear,
             they show up here.

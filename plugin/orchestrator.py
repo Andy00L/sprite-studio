@@ -206,6 +206,18 @@ class TimelineLastShotError(OrchestratorError):
     """Floor reached: deleting would leave the timeline empty."""
 
 
+class ProjectBusyError(OrchestratorError):
+    """Raised by delete_project when in-flight task cancellation does not
+    complete within the timeout. Caller (slash handler / HTTP route) should
+    surface this as a retryable error, not a hard failure.
+    """
+
+    def __init__(self, project_id: str, reason: str) -> None:
+        super().__init__(f"project busy: {reason}")
+        self.project_id = project_id
+        self.reason = reason
+
+
 # Strong-reference set for fire-and-forget background tasks. Per the asyncio
 # docs (https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task):
 #   "Save a reference to the result of this function, to avoid a task
@@ -253,6 +265,22 @@ def has_background_task(name: str) -> bool:
         if t.get_name() == name and not t.done():
             return True
     return False
+
+
+def _project_dir_size_bytes(path: Path) -> int:
+    """Sum sizes of every regular file under path. Returns 0 if path is
+    missing. Used by delete_project to report freed disk to the caller.
+    """
+    if not path.exists():
+        return 0
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 # Patterns that may leak through into error_message strings: filesystem
@@ -3262,3 +3290,146 @@ class ProjectOrchestrator:
         caller wants to block on the result.
         """
         return self._render_tasks.get(project_id)
+
+    async def delete_project(
+        self,
+        project_id: str,
+        *,
+        cancel_timeout_s: float = 10.0,
+    ) -> dict:
+        """Cancel any in-flight work, cascade-delete DB rows, remove asset dir.
+
+        Three-step teardown:
+          1. Signal cooperative cancel + hard-cancel any tracked asyncio.Task
+             whose name ends with this project_id (timeline_gen, render).
+             Wait briefly for the task to acknowledge; raise ProjectBusyError
+             if it doesn't.
+          2. Cascade-delete all DB rows in a single txn (db.delete_project_cascade,
+             which re-validates the ULID before any SQL).
+          3. shutil.rmtree the project's asset directory. A failed rmtree is
+             logged but does NOT roll back the DB delete: orphan dirs are
+             cheaper to sweep at next startup than a half-deleted DB.
+
+        Path-traversal defense: ULID validated here AND in db.delete_project_cascade.
+
+        Raises:
+            ValueError: project_id is not a valid ULID.
+            db.ProjectNotFoundError: no project row matches project_id.
+            ProjectBusyError: cancellation did not complete in cancel_timeout_s.
+        """
+        if not db._is_valid_ulid(project_id):
+            raise ValueError(f"invalid project_id: {project_id!r}")
+
+        project = db.get_project(project_id)
+        if project is None:
+            raise db.ProjectNotFoundError(f"project not found: {project_id}")
+
+        try:
+            await self._cancel_all_tasks_for_project(
+                project_id, timeout_s=cancel_timeout_s,
+            )
+        except asyncio.TimeoutError as e:
+            raise ProjectBusyError(
+                project_id,
+                f"in-flight tasks did not cancel within {cancel_timeout_s}s; "
+                f"retry shortly",
+            ) from e
+
+        # Defensive: tasks that crashed mid-flight may have left jobs in
+        # 'queued' or 'running'. Mark them cancelled before the cascade so
+        # the row history reflects the user-driven exit reason.
+        for status in ("queued", "running"):
+            for job in db.list_jobs(project_id=project_id, status=status):
+                try:
+                    db.mark_job_cancelled(job["id"], reason="project deleted")
+                except Exception:
+                    logger.debug(
+                        "delete_project: could not mark job %s cancelled",
+                        job["id"],
+                    )
+
+        project_dir = PROJECTS_ROOT / project_id
+        freed_bytes = _project_dir_size_bytes(project_dir)
+
+        result = db.delete_project_cascade(project_id)
+
+        if project_dir.exists():
+            try:
+                shutil.rmtree(project_dir)
+            except OSError as e:
+                # DB rows are gone; the assets dir is now orphaned. Logging
+                # is enough; the next startup sweep can reclaim the disk.
+                logger.warning(
+                    "delete_project: rmtree failed pid=%s err=%s "
+                    "(DB row gone, asset dir orphaned)",
+                    project_id, e,
+                )
+
+        # Free the per-project render-task slot so a future project with the
+        # same id (impossible with ULIDs, but defensive) gets a clean slot.
+        self._render_tasks.pop(project_id, None)
+
+        logger.info(
+            "deleted project pid=%s freed=%dB rows=%s",
+            project_id, freed_bytes, result["rows_removed"],
+        )
+        return {
+            "deleted": True,
+            "id": project_id,
+            "freed_bytes": freed_bytes,
+            "rows_removed": result["rows_removed"],
+        }
+
+    async def _cancel_all_tasks_for_project(
+        self,
+        project_id: str,
+        *,
+        timeout_s: float = 10.0,
+    ) -> None:
+        """Cancel render + background tasks for this project, then await them.
+
+        Render: cooperative signal via CANCELLATION_REGISTRY (lets the worker
+        finish its current shot's ffmpeg cleanly), THEN hard-cancel the
+        asyncio.Task to short-circuit the wait between shots.
+
+        Background tasks: name pattern is "<kind>_<project_id>" (e.g.
+        timeline_gen_01KQ..., render_01KQ...). Match by suffix; a ULID is
+        globally unique so cross-project collision is impossible.
+
+        Raises asyncio.TimeoutError if any task is still pending after
+        timeout_s (the caller wraps this in ProjectBusyError).
+        """
+        from . import workers as _workers
+
+        tasks_to_wait: list[asyncio.Task] = []
+
+        render_task = self._render_tasks.get(project_id)
+        if render_task is not None and not render_task.done():
+            await _workers.cancel_render(project_id)
+            render_task.cancel()
+            tasks_to_wait.append(render_task)
+
+        suffix = f"_{project_id}"
+        for t in list(_BACKGROUND_TASKS):
+            if t.done():
+                continue
+            if t.get_name().endswith(suffix):
+                t.cancel()
+                tasks_to_wait.append(t)
+
+        if not tasks_to_wait:
+            return
+
+        logger.info(
+            "delete_project: cancelling %d task(s) for pid=%s",
+            len(tasks_to_wait), project_id,
+        )
+        _done, pending = await asyncio.wait(
+            tasks_to_wait, timeout=timeout_s,
+        )
+        if pending:
+            for t in pending:
+                t.cancel()
+            raise asyncio.TimeoutError(
+                f"{len(pending)} task(s) did not cancel within {timeout_s}s"
+            )

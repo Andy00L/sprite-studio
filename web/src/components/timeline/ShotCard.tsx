@@ -14,6 +14,9 @@ interface Props {
   onClick: () => void;
   ref?: Ref<HTMLDivElement>;
   dragHandle?: HTMLAttributes<HTMLDivElement>;
+  // P19a-22: when true the card is rendered without press feedback or
+  // pointer cursor so a past-phase view doesn't suggest the shot is editable.
+  readOnly?: boolean;
 }
 
 export function ShotCard({
@@ -26,6 +29,7 @@ export function ShotCard({
   onClick,
   ref,
   dragHandle,
+  readOnly = false,
 }: Props): JSX.Element {
   const hasReal = Boolean(shot.reference_still_path);
   const kind = kindForShot({ characters_present: shot.characters_present, camera: shot.camera });
@@ -37,8 +41,8 @@ export function ShotCard({
   return (
     <div
       ref={ref}
-      className="box-hand pressy"
-      onClick={onClick}
+      className={readOnly ? 'box-hand' : 'box-hand pressy'}
+      onClick={readOnly ? undefined : onClick}
       {...dragHandle}
       style={{
         position: 'absolute',
@@ -48,7 +52,7 @@ export function ShotCard({
         height: height - 16,
         background: 'var(--paper)',
         padding: 6,
-        cursor: 'pointer',
+        cursor: readOnly ? 'default' : 'pointer',
       }}
     >
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>

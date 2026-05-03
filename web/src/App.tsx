@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import type { JSX } from 'react';
-import { useStore } from './state/store';
+import { useStore, selectEffectivePhase } from './state/store';
 import { Header } from './components/chrome/Header';
 import { ChatDock } from './components/chrome/ChatDock';
 import { PopoverHost } from './components/popovers/PopoverHost';
@@ -45,6 +45,10 @@ export function App(): JSX.Element {
   const setActiveProject = useStore((s) => s.setActiveProject);
   const checkAssets = useStore((s) => s.checkAssets);
   const refreshShow = useStore((s) => s.refreshShow);
+  // P19a-22: route by effectivePhase so a click in the Header phase strip
+  // flips the screen even when the project hasn't moved (read-only nav on
+  // a done/failed project). When viewedPhase is null this matches project.phase.
+  const effPhase = useStore(selectEffectivePhase);
 
   useEffect(() => {
     void checkAssets();
@@ -54,17 +58,17 @@ export function App(): JSX.Element {
   let body: JSX.Element;
   if (!project) {
     body = <LobbyScreen />;
-  } else if (project.phase === 'brief') {
+  } else if (effPhase === 'brief') {
     // Key by project id so transitions between drafts (or phantom -> real)
     // remount the screen and rebuild initial form state from scratch.
     body = <BriefScreen key={project.id || 'new'} />;
-  } else if (project.phase === 'cast') {
+  } else if (effPhase === 'cast') {
     body = <CastScreen />;
-  } else if (project.phase === 'timeline') {
+  } else if (effPhase === 'timeline') {
     body = <TimelineScreen />;
-  } else if (project.phase === 'render') {
+  } else if (effPhase === 'render') {
     body = <RenderScreen />;
-  } else if (project.phase === 'done' || project.phase === 'failed') {
+  } else if (effPhase === 'done' || effPhase === 'failed') {
     body = <DoneScreen />;
   } else {
     body = <LobbyScreen />;

@@ -32,11 +32,12 @@ _MODELS_FORBID_TEMPERATURE = {"moonshotai/kimi-k2.6"}
 # Per https://www.python-httpx.org/advanced/timeouts/ the read timeout is
 # "the maximum duration to wait for a chunk of data to be received". Kimi
 # K2.6's hidden reasoning trace can suppress emission for 100-200s on
-# medium-sized JSON outputs (cast designer empirically hit 172s in prod).
-# 300s gives ~2x headroom over observed worst case without letting a stuck
-# call hang for many minutes. Used as the fallback when a caller does not
-# supply read_timeout_seconds explicitly.
-DEFAULT_LLM_READ_TIMEOUT_S = 300.0
+# medium-sized JSON outputs (cast designer empirically hit 172s; live
+# 5-character timeline writer call on the Hippo Incident render exceeded
+# 300s and tripped the prior ceiling). The fallback now reads from
+# _http.LLM_TIMEOUT (600s) so all LLM-specific timeout tuning lives in
+# one place; callers can still override per-request via
+# read_timeout_seconds when they know a prompt is even slower.
 
 
 class ChatClient:
@@ -103,7 +104,7 @@ class ChatClient:
     ) -> dict:
         """JSON-mode chat. Returns the parsed JSON object that came back as
         choices[0].message.content. read_timeout_seconds optionally
-        overrides DEFAULT_LLM_READ_TIMEOUT_S for this call (Kimi reasoning
+        overrides _http.LLM_TIMEOUT.read for this call (Kimi reasoning
         traces can outrun the default for big outputs)."""
         data = await self._chat_raw(
             model=model,
@@ -174,7 +175,7 @@ class ChatClient:
             read_to = (
                 read_timeout_seconds
                 if read_timeout_seconds is not None
-                else DEFAULT_LLM_READ_TIMEOUT_S
+                else _http.LLM_TIMEOUT.read
             )
 
             async def _do() -> httpx.Response:
@@ -183,10 +184,10 @@ class ChatClient:
                     json=body,
                     headers=self._auth_headers(),
                     timeout=httpx.Timeout(
-                        connect=_http.HTTP_CONNECT,
+                        connect=_http.LLM_TIMEOUT.connect,
                         read=read_to,
-                        write=30.0,
-                        pool=5.0,
+                        write=_http.LLM_TIMEOUT.write,
+                        pool=_http.LLM_TIMEOUT.pool,
                     ),
                 )
 

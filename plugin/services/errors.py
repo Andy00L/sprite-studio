@@ -53,6 +53,24 @@ class ProviderServerError(SpriteStudioError):
     """5xx after retry budget exhausted."""
 
 
+class SeedanceTaskFailedError(ProviderServerError):
+    """Seedance vendor reported FAILURE on the polling endpoint.
+
+    Distinct from a transport-level 5xx so callers can branch on a
+    terminal vendor task failure (e.g. inspect the failure code) without
+    catching every ProviderServerError.
+    """
+
+
+class SeedanceAudioSafetyError(SeedanceTaskFailedError):
+    """Vendor refused audio-bearing render (OutputAudioSensitiveContentDetected).
+
+    Caller should retry once with generate_audio=False. Visual output is
+    unaffected; the narrator track is mixed in post-stitch so dialog the
+    vendor refused to voice is still covered by narration.
+    """
+
+
 class ProviderContentPolicyError(SpriteStudioError):
     """content_policy_violation, moderation_blocked, safety_filter, etc.
     NEVER retried. The caller surfaces a friendly message to the user."""

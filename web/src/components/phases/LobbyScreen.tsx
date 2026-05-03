@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { JSX } from 'react';
+import type { JSX, MouseEvent } from 'react';
 import { useStore, type LobbyFilter } from '../../state/store';
 import type { Project, ProjectListEntry } from '../../types/sprite';
 import { ShotStill } from '../sprites/ShotStill';
@@ -46,6 +46,8 @@ export function LobbyScreen(): JSX.Element {
     };
     useStore.setState({ project: phantom, characters: [], shots: [] });
   };
+
+  const deleteProject = useStore((s) => s.deleteProject);
 
   return (
     <div
@@ -122,7 +124,12 @@ export function LobbyScreen(): JSX.Element {
           }}
         >
           {projects.map((p) => (
-            <ProjectCard key={p.id} project={p} onOpen={() => void openProject(p.id)} />
+            <ProjectCard
+              key={p.id}
+              project={p}
+              onOpen={() => void openProject(p.id)}
+              onDelete={() => deleteProject(p.id, filter)}
+            />
           ))}
           <div
             className="box-soft pressy"
@@ -157,9 +164,15 @@ export function LobbyScreen(): JSX.Element {
 interface CardProps {
   project: ProjectListEntry;
   onOpen: () => void;
+  onDelete: () => Promise<void>;
 }
 
-function ProjectCard({ project, onOpen }: CardProps): JSX.Element {
+function ProjectCard({ project, onOpen, onDelete }: CardProps): JSX.Element {
+  const [hovered, setHovered] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
   const phaseColor =
     project.phase === 'done'
       ? 'var(--good)'
@@ -170,11 +183,41 @@ function ProjectCard({ project, onOpen }: CardProps): JSX.Element {
   const thumbUrl = project.thumb_path ? thumbPathToUrl(project.thumb_path) : null;
   const title = project.title ?? (project.brief ? project.brief.slice(0, 40) : 'untitled');
 
+  const handleCardClick = () => {
+    // Suppress card-open while the confirm overlay is up. Clicking outside
+    // the buttons should be a no-op, not navigate into a project we're
+    // about to delete.
+    if (confirming || deleting) return;
+    onOpen();
+  };
+
+  const handleConfirmDelete = async (e: MouseEvent) => {
+    e.stopPropagation();
+    setDeleting(true);
+    setError(null);
+    try {
+      await onDelete();
+      // No setState(false) here; the parent unmounts this card on success.
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setDeleting(false);
+    }
+  };
+
   return (
     <div
       className="box-hand pressy"
-      onClick={onOpen}
-      style={{ padding: 12, background: 'var(--paper)', cursor: 'pointer' }}
+      onClick={handleCardClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        padding: 12,
+        background: 'var(--paper)',
+        cursor: confirming || deleting ? 'default' : 'pointer',
+        position: 'relative',
+        opacity: deleting ? 0.55 : 1,
+        transition: 'opacity 120ms',
+      }}
     >
       <div
         style={{
@@ -235,6 +278,117 @@ function ProjectCard({ project, onOpen }: CardProps): JSX.Element {
       <div className="mono" style={{ fontSize: 9, color: 'var(--ink-faint)', marginTop: 4 }}>
         ${project.total_cost_usd.toFixed(2)}
       </div>
+
+      {hovered && !confirming && !deleting && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            setConfirming(true);
+            setError(null);
+          }}
+          aria-label="Delete project"
+          title="Delete project"
+          style={{
+            position: 'absolute',
+            top: 6,
+            right: 6,
+            width: 24,
+            height: 24,
+            borderRadius: 4,
+            border: '1px solid var(--rule)',
+            background: 'var(--paper)',
+            cursor: 'pointer',
+            display: 'grid',
+            placeItems: 'center',
+            fontSize: 12,
+            lineHeight: 1,
+            color: 'var(--ink-faint)',
+            padding: 0,
+          }}
+        >
+          ×
+        </button>
+      )}
+
+      {confirming && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            background: 'rgba(255, 253, 248, 0.96)',
+            borderRadius: 3,
+            display: 'grid',
+            placeItems: 'center',
+            padding: 16,
+            zIndex: 2,
+          }}
+        >
+          <div style={{ textAlign: 'center', maxWidth: 240 }}>
+            <div
+              className="serif-it"
+              style={{ fontSize: 22, lineHeight: 1.15, marginBottom: 6 }}
+            >
+              Delete this project?
+            </div>
+            <div
+              className="mono"
+              style={{
+                fontSize: 9,
+                color: 'var(--ink-faint)',
+                marginBottom: 14,
+                letterSpacing: '0.06em',
+              }}
+            >
+              CANNOT BE UNDONE
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+              <button
+                type="button"
+                className="cta"
+                onClick={handleConfirmDelete}
+                disabled={deleting}
+                style={{
+                  background: 'var(--bad, #b03a2e)',
+                  color: 'var(--paper)',
+                  borderColor: 'var(--bad, #b03a2e)',
+                  opacity: deleting ? 0.6 : 1,
+                  cursor: deleting ? 'wait' : 'pointer',
+                }}
+              >
+                {deleting ? 'deleting…' : 'delete'}
+              </button>
+              <button
+                type="button"
+                className="pill"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirming(false);
+                  setError(null);
+                }}
+                disabled={deleting}
+                style={{ cursor: deleting ? 'wait' : 'pointer' }}
+              >
+                cancel
+              </button>
+            </div>
+            {error && (
+              <div
+                className="mono"
+                style={{
+                  fontSize: 9,
+                  color: 'var(--bad, #b03a2e)',
+                  marginTop: 10,
+                  wordBreak: 'break-word',
+                }}
+              >
+                {error}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

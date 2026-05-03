@@ -18,6 +18,7 @@ from .orchestrator import (
     CastTooSmallError,
     CharacterNotFoundError,
     OrchestratorError,
+    ProjectBusyError,
     ProjectInWrongPhaseError,
     ProjectOrchestrator,
     RenderInProgressError,
@@ -1695,6 +1696,47 @@ async def sprite_purge_handler(raw_args: str = "", **kwargs) -> str:
     return json.dumps({"status": "purged", **result})
 
 
+# ---- /sprite_delete_project ----
+
+async def sprite_delete_project_handler(raw_args: str = "", **kwargs) -> str:
+    """Delete a project (lobby UX).
+
+    Differs from /sprite_purge: no --confirm gate (the UI shows the modal),
+    auto-cancels in-flight render/timeline tasks instead of refusing. Path
+    traversal blocked by ULID validation in db.delete_project_cascade.
+    """
+    pid = (_strip_brief_quotes(raw_args) or "").strip()
+    if not pid:
+        return _err_json("usage: /sprite_delete_project <project_id>")
+
+    project = db.get_project(pid)
+    if project is None:
+        return json.dumps({
+            "status": "not_found",
+            "id": pid,
+        })
+    if project.get("user_id") != _USER_ID:
+        return _err_json(
+            "project does not belong to current user",
+            project_id=pid,
+            error_class="forbidden",
+        )
+
+    orchestrator = _get_orchestrator()
+    try:
+        result = await orchestrator.delete_project(pid)
+    except ValueError as e:
+        return _err_json(str(e), error_class="invalid_id", id=pid)
+    except db.ProjectNotFoundError:
+        return json.dumps({"status": "not_found", "id": pid})
+    except ProjectBusyError as e:
+        return _err_json(
+            str(e), error_class="busy", id=pid, reason=e.reason,
+        )
+
+    return json.dumps({"status": "deleted", **result})
+
+
 # ---- /sprite_list ----
 
 async def sprite_list_handler(raw_args: str = "", **kwargs) -> str:
@@ -2546,6 +2588,13 @@ SLASH_COMMANDS: dict[str, dict] = {
     "sprite_purge": {
         "description": "Delete a project and all its data. Use --confirm to proceed.",
         "handler": sprite_purge_handler,
+    },
+    "sprite_delete_project": {
+        "description": (
+            "Delete a project by id (auto-cancels in-flight render). "
+            "Lobby UX; /sprite_purge is the --confirm-gated CLI variant."
+        ),
+        "handler": sprite_delete_project_handler,
     },
     "sprite_list": {
         "description": "List recent projects. --phase <phase> --limit <n>",
