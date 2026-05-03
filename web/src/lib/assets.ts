@@ -49,9 +49,15 @@ export function shotVideoUrl(
 export function projectFinalVideoUrl(
   projectId: string,
   version?: number | null,
+  options?: { download?: boolean; filename?: string },
 ): string {
-  const v = version ? `?v=${version}` : '';
-  return `${assetBase()}/${projectId}/output/final.mp4${v}`;
+  const params = new URLSearchParams();
+  if (version) params.set('v', String(version));
+  if (options?.download) params.set('download', '1');
+  if (options?.filename) params.set('name', options.filename);
+  const qs = params.toString();
+  const tail = qs ? `?${qs}` : '';
+  return `${assetBase()}/${projectId}/output/final.mp4${tail}`;
 }
 
 export async function checkAssetServer(): Promise<boolean> {

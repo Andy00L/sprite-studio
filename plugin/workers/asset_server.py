@@ -18,6 +18,7 @@ import logging
 import mimetypes
 import os
 import re
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -111,10 +112,23 @@ async def serve_asset(request: web.Request) -> web.StreamResponse:
         raise web.HTTPForbidden(reason=f"extension {target.suffix} not served")
 
     content_type, _ = mimetypes.guess_type(str(target))
-    return web.FileResponse(
-        target,
-        headers={"Content-Type": content_type or "application/octet-stream"},
-    )
+
+    response_headers: dict[str, str] = {
+        "Content-Type": content_type or "application/octet-stream",
+    }
+    if request.query.get("download") in ("1", "true", "yes"):
+        # Sanitize: strip CR/LF and anything outside [A-Za-z0-9._-] so a
+        # crafted ?name= can't inject a header line into the response.
+        # Empty result falls back to a generic name.
+        raw_name = request.query.get("name") or target.name
+        safe_ascii = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("_") or "download"
+        safe_utf8 = urllib.parse.quote(raw_name, safe="")
+        response_headers["Content-Disposition"] = (
+            f'attachment; filename="{safe_ascii}"; '
+            f"filename*=UTF-8''{safe_utf8}"
+        )
+
+    return web.FileResponse(target, headers=response_headers)
 
 
 async def health(request: web.Request) -> web.Response:

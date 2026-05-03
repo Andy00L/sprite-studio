@@ -1251,7 +1251,22 @@ def _derive_timeline_status(project: dict, shots: list) -> str:
     if phase in ("brief", "cast"):
         return "not_started"
     if phase == "timeline":
-        return "ready" if shots else "generating"
+        if not shots:
+            return "generating"
+        # Reference stills are produced by image_edit jobs running in
+        # parallel AFTER timeline_writer persists shot rows. Each shot
+        # row arrives with reference_still_path=NULL and gets filled
+        # 144 to 162 seconds later as its image_edit completes. Until
+        # every shot has its path, the timeline isn't presentable:
+        # ShotCard renders the SVG placeholder when path is null
+        # (web/src/components/timeline/ShotCard.tsx:34), and
+        # sprite_approve_timeline rejects projects with missing
+        # reference stills. Keep the frontend's TimelineScreen polling
+        # until all stills land so state.shots gets refreshed and the
+        # img elements mount.
+        if any(not s.get("reference_still_path") for s in shots):
+            return "generating"
+        return "ready"
     if phase in ("render", "done"):
         return "ready"
     return "unknown"

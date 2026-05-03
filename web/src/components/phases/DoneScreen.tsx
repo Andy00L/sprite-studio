@@ -22,6 +22,19 @@ export function DoneScreen(): JSX.Element {
   const videoUrl = project.final_video_path
     ? projectFinalVideoUrl(project.id, project.updated_at)
     : null;
+  // Mirror the backend [^A-Za-z0-9._-]+ → _ sanitization so the suggested
+  // filename matches what the server will set in Content-Disposition.
+  const downloadStem =
+    (project.title || 'sprite-studio-video')
+      .replace(/[^A-Za-z0-9._-]+/g, '_')
+      .replace(/^_+|_+$/g, '') || 'sprite-studio-video';
+  const downloadFilename = `${downloadStem}.mp4`;
+  const downloadUrl = project.final_video_path
+    ? projectFinalVideoUrl(project.id, project.updated_at, {
+        download: true,
+        filename: downloadFilename,
+      })
+    : null;
 
   return (
     <PhaseCanvas phase={project.phase}>
@@ -63,16 +76,29 @@ export function DoneScreen(): JSX.Element {
                 padding: 14,
                 display: 'inline-block',
                 background: 'var(--paper)',
+                maxWidth: 540,
               }}
             >
+              {/*
+                Cap height so the full DoneScreen stack fits without
+                scrolling. The 400px subtracts non-video chrome:
+                  ~32 outer top padding + ~20 status line + ~64 h1 +
+                  ~30 subtitle + ~22 box margin + ~28 box padding y +
+                  ~64 stats grid + ~70 buttons row + ~32 outer bottom +
+                  ~40 chat dock + ~18 slack.
+                width:auto + object-fit:contain preserves aspect ratio
+                for both 9:16 and future 16:9 outputs.
+              */}
               <video
                 src={videoUrl}
                 controls
                 preload="metadata"
                 style={{
-                  width: 540,
                   maxWidth: '100%',
+                  maxHeight: 'calc(100vh - 400px)',
+                  width: 'auto',
                   height: 'auto',
+                  objectFit: 'contain',
                   display: 'block',
                   border: '1.5px solid var(--rule)',
                 }}
@@ -104,10 +130,10 @@ export function DoneScreen(): JSX.Element {
           )}
 
           <div style={{ display: 'flex', gap: 10, justifyContent: 'center', marginTop: 22 }}>
-            {videoUrl && (
+            {downloadUrl && (
               <a
-                href={videoUrl}
-                download
+                href={downloadUrl}
+                download={downloadFilename}
                 className="cta cta-ghost"
                 style={{ textDecoration: 'none' }}
               >

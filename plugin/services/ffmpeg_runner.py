@@ -318,20 +318,6 @@ def _has_visual_transitions(transitions: Optional[list[str]]) -> bool:
     return any(t in TRANSITION_TO_XFADE for t in transitions[:-1])
 
 
-def _shot_has_audio(path: Path) -> bool:
-    """Probe a shot file for an audio stream. False when ffprobe finds none.
-
-    Pre-pass for the xfade pipeline so we know up front which shots need a
-    silent placeholder audio source (Seedance produces video-only MP4s when
-    has_dialog=False, so this is the common case).
-    """
-    info = probe(path)
-    return any(
-        s.get("codec_type") == "audio"
-        for s in info.get("streams", []) or []
-    )
-
-
 def _xfade_videos(
     inputs: list[Path],
     transitions: list[str],
@@ -406,20 +392,27 @@ def _xfade_videos(
             next_idx += 1
 
     # Per-input normalization. Without this xfade rejects pairs whose
-    # resolution / pix_fmt / fps / SAR / sample format / channel layout
-    # don't match — Seedance is consistent in practice but defensive
-    # normalization is cheap and removes a class of mid-render failures.
+    # resolution / pix_fmt / fps / SAR / sample format / channel layout /
+    # timebase don't match. Seedance is consistent in practice but
+    # defensive normalization is cheap. settb/asettb is required because
+    # chained concat-in-filter promotes the accumulator timebase to
+    # AV_TIME_BASE (1/1000000), and a freshly-normalized xfade input
+    # stays at 1/<fps>; xfade then rejects the pair. Per-input settb is
+    # the defensive half of the fix; the post-concat re-assertion below
+    # is the load-bearing half.
     fc_parts: list[str] = []
     for i in range(n):
         fc_parts.append(
             f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"setsar=1,fps={target_fps},format=yuv420p[v{i}]"
+            f"setsar=1,fps={target_fps},format=yuv420p,"
+            f"settb=1/{target_fps}[v{i}]"
         )
         a_src = silence_input_idx.get(i, i)
         fc_parts.append(
             f"[{a_src}:a]aresample=48000,"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{i}]"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"asettb=1/48000[a{i}]"
         )
 
     # Sequential pairwise join. Each step pulls in [v_i][a_i] and produces
@@ -438,12 +431,17 @@ def _xfade_videos(
         if xfade_kind is None:
             # Hard cut. concat-in-filter so the output streams stay inside
             # this filtergraph (the demuxer-concat would require a manifest
-            # file and a separate ffmpeg invocation).
+            # file and a separate ffmpeg invocation). Re-assert the
+            # timebase on the accumulator: concat promotes its output to
+            # AV_TIME_BASE, which would mismatch any subsequent xfade
+            # input still at 1/<fps>.
             fc_parts.append(
-                f"[{cur_v}][v{i}]concat=n=2:v=1:a=0[{next_v}]"
+                f"[{cur_v}][v{i}]concat=n=2:v=1:a=0,"
+                f"settb=1/{target_fps}[{next_v}]"
             )
             fc_parts.append(
-                f"[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}]"
+                f"[{cur_a}][a{i}]concat=n=2:v=0:a=1,"
+                f"asettb=1/48000[{next_a}]"
             )
             cumulative_v_dur += durations[i]
         else:
@@ -458,10 +456,12 @@ def _xfade_videos(
                     i, offset,
                 )
                 fc_parts.append(
-                    f"[{cur_v}][v{i}]concat=n=2:v=1:a=0[{next_v}]"
+                    f"[{cur_v}][v{i}]concat=n=2:v=1:a=0,"
+                    f"settb=1/{target_fps}[{next_v}]"
                 )
                 fc_parts.append(
-                    f"[{cur_a}][a{i}]concat=n=2:v=0:a=1[{next_a}]"
+                    f"[{cur_a}][a{i}]concat=n=2:v=0:a=1,"
+                    f"asettb=1/48000[{next_a}]"
                 )
                 cumulative_v_dur += durations[i]
             else:
@@ -769,7 +769,7 @@ def compute_dialog_windows(
 
     When a shot's transition_field value is 'fade' or 'dissolve', the
     cursor advances by (duration - transition_overlap_seconds) instead of
-    full duration — matching the xfade pipeline's overlap accounting.
+    full duration, matching the xfade pipeline's overlap accounting.
     Missing transition_field values are treated as hard cuts, so this is
     backward compatible with shots predating the P19-pre migration.
     """
