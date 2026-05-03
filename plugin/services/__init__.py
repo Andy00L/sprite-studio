@@ -1,5 +1,6 @@
 """Service-layer public exports."""
 from .errors import (
+    ImageGenEmptyError,
     ProviderAuthError,
     ProviderContentPolicyError,
     ProviderInsufficientCreditsError,
@@ -73,6 +74,7 @@ __all__ = [
     "ProviderContentPolicyError",
     "ProviderTimeoutError",
     "ProviderResponseShapeError",
+    "ImageGenEmptyError",
     "ProviderInsufficientCreditsError",
     "ProviderInvalidRequestError",
     "probe",

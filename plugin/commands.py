@@ -15,6 +15,7 @@ from . import db, env
 from .orchestrator import (
     CastConfirmationRequiredError,
     CastFullError,
+    CastIncompleteError,
     CastTooSmallError,
     CharacterNotFoundError,
     OrchestratorError,
@@ -641,6 +642,17 @@ async def sprite_cast_handler(raw_args: str = "", **kwargs) -> str:
         )
     except ProjectInWrongPhaseError as e:
         return _err_json(str(e), project_id=project_id)
+    except CastIncompleteError as e:
+        return _err_json(
+            f"cast advance blocked: {e}. "
+            f"Run /sprite_repair_cast to regenerate, or "
+            f"/sprite_edit_character per character.",
+            project_id=project_id,
+            error_class="cast_incomplete",
+            missing=[
+                {"name": n, "reason": r} for n, r in e.missing
+            ],
+        )
     except OrchestratorError as e:
         return _err_json(str(e), project_id=project_id)
     except ProviderContentPolicyError as e:
@@ -989,6 +1001,17 @@ async def sprite_approve_cast_handler(raw_args: str = "", **kwargs) -> str:
         result = await orchestrator.approve_cast(project_id=project["id"])
     except ProjectInWrongPhaseError as e:
         return _err_json(str(e), project_id=project["id"])
+    except CastIncompleteError as e:
+        return _err_json(
+            f"cannot approve cast: {len(e.missing)} character sheet(s) "
+            f"missing on disk ("
+            + ", ".join(n for n, _ in e.missing)
+            + "). Run /sprite_repair_cast to regenerate, or "
+            f"/sprite_edit_character <id> \"regenerate\" per character.",
+            project_id=project["id"],
+            error_class="cast_incomplete",
+            missing=[{"name": n, "reason": r} for n, r in e.missing],
+        )
     except OrchestratorError as e:
         return _err_json(str(e), project_id=project["id"])
 
@@ -1551,6 +1574,29 @@ async def sprite_show_handler(raw_args: str = "", **kwargs) -> str:
     if _is_chat_surface(surface):
         return _format_show_for_telegram(project, characters)
 
+    # On-disk audit so the frontend can render a "repair cast" banner
+    # without inferring missing-sheet state from <img onError> alone.
+    cast_errors: list[dict[str, str]] = []
+    for c in characters:
+        path_str = c.get("master_sheet_path")
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if not p.exists():
+            cast_errors.append({
+                "character_id": c["id"],
+                "name": c["name"],
+                "error_class": "sheet_missing_on_disk",
+                "path": path_str,
+            })
+        elif p.stat().st_size == 0:
+            cast_errors.append({
+                "character_id": c["id"],
+                "name": c["name"],
+                "error_class": "sheet_zero_bytes",
+                "path": path_str,
+            })
+
     response: dict[str, Any] = {
         "project_id": project_id,
         "phase": project["phase"],
@@ -1581,6 +1627,7 @@ async def sprite_show_handler(raw_args: str = "", **kwargs) -> str:
         "final_video_path": project.get("final_video_path"),
         "music_track_path": project.get("music_track_path"),
         "error_message": project.get("error_message"),
+        "errors": cast_errors,
         "timeline_status": _derive_timeline_status(project, shots),
     }
 
@@ -2521,6 +2568,57 @@ async def sprite_set_project_refs_handler(raw_args: str = "", **kwargs) -> str:
     })
 
 
+# ---- /sprite_repair_cast ----
+
+async def sprite_repair_cast_handler(raw_args: str = "", **kwargs) -> str:
+    """Regenerate any character sheets whose bytes are missing on disk.
+
+    Idempotent: characters with a sheet present and non-zero on disk are
+    skipped. Each repair runs through the same image-gen path as the
+    original cast advance, so cost is recorded and the sheet ends up at
+    the same persisted master_sheet_path.
+    """
+    pid = (_strip_brief_quotes(raw_args) or "").strip()
+    if not pid:
+        pid = (kwargs.get("project_id") or "").strip()
+    if not pid:
+        latest = db.latest_project_for_user(_USER_ID)
+        if latest is None:
+            return _err_json(
+                "usage: /sprite_repair_cast <project_id>",
+            )
+        pid = latest["id"]
+
+    project = db.get_project(pid)
+    if project is None:
+        return _err_json(f"project not found: {pid!r}")
+    if project.get("user_id") != _USER_ID:
+        return _err_json(
+            "project does not belong to current user",
+            project_id=pid,
+            error_class="forbidden",
+        )
+
+    orchestrator = _get_orchestrator()
+    try:
+        result = await orchestrator.repair_cast(project_id=pid)
+    except ValueError as e:
+        return _err_json(str(e), error_class="invalid_id", project_id=pid)
+    except OrchestratorError as e:
+        return _err_json(str(e), project_id=pid)
+    except SpriteStudioError as e:
+        return _err_json(
+            f"repair_cast failed: {e}",
+            project_id=pid,
+            error_class=e.__class__.__name__,
+        )
+
+    return json.dumps({
+        "status": "ok",
+        **result,
+    })
+
+
 SLASH_COMMANDS: dict[str, dict] = {
     "start": {
         "description": "Welcome / quick-start guide (Telegram convention)",
@@ -2647,5 +2745,13 @@ SLASH_COMMANDS: dict[str, dict] = {
     "sprite_set_project_refs": {
         "description": "Bind uploaded ref image paths to the active brief-phase project",
         "handler": sprite_set_project_refs_handler,
+    },
+    "sprite_repair_cast": {
+        "description": (
+            "Regenerate character sheets whose files vanished on disk. "
+            "Idempotent; auto-regenerates affected reference stills "
+            "if the project already advanced to timeline."
+        ),
+        "handler": sprite_repair_cast_handler,
     },
 }

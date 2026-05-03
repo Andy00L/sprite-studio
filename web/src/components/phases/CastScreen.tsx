@@ -1,5 +1,9 @@
-import type { JSX } from 'react';
-import { useStore, selectIsReadOnlyView } from '../../state/store';
+import { useState, type JSX } from 'react';
+import {
+  useStore,
+  selectIsCastIncomplete,
+  selectIsReadOnlyView,
+} from '../../state/store';
 import { PhaseCanvas } from './PhaseCanvas';
 import { CharacterCard } from '../chrome/CharacterCard';
 
@@ -8,15 +12,74 @@ export function CastScreen(): JSX.Element {
   const project = useStore((s) => s.project);
   const openPopover = useStore((s) => s.openPopover);
   const readOnly = useStore(selectIsReadOnlyView);
+  const castIncomplete = useStore(selectIsCastIncomplete);
+  const castErrors = useStore((s) => s.castErrors);
+  const repairCast = useStore((s) => s.repairCast);
+  const [repairing, setRepairing] = useState(false);
 
   const projectId = project?.id ?? '';
 
+  const onRepair = async (): Promise<void> => {
+    if (repairing || !projectId) return;
+    setRepairing(true);
+    try {
+      await repairCast(projectId);
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   return (
     <PhaseCanvas phase="cast">
+      {!readOnly && castIncomplete && (
+        <div
+          className="box-soft"
+          style={{
+            position: 'absolute',
+            top: 8,
+            left: 36,
+            right: 36,
+            padding: '10px 14px',
+            background: '#fff4d6',
+            border: '1px solid #d6b25a',
+            display: 'flex',
+            gap: 12,
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            zIndex: 2,
+          }}
+          role="alert"
+        >
+          <div style={{ fontSize: 14, color: 'var(--ink)' }}>
+            <strong>{castErrors.length}</strong> sprite-sheet
+            {castErrors.length === 1 ? '' : 's'} failed to write to disk
+            {castErrors.length > 0 && (
+              <>
+                {' '}
+                ({castErrors.map((e) => e.name).join(', ')})
+              </>
+            )}
+            . Click <em>repair cast</em> to regenerate.
+          </div>
+          <button
+            type="button"
+            className="pressy"
+            onClick={onRepair}
+            disabled={repairing}
+            style={{
+              padding: '6px 14px',
+              fontSize: 14,
+              cursor: repairing ? 'wait' : 'pointer',
+            }}
+          >
+            {repairing ? 'repairing…' : 'repair cast'}
+          </button>
+        </div>
+      )}
       <div
         style={{
           position: 'absolute',
-          top: 24,
+          top: castIncomplete && !readOnly ? 64 : 24,
           left: 36,
           right: 36,
           bottom: 200,

@@ -3,6 +3,7 @@ import { subscribeWithSelector } from 'zustand/middleware';
 import { getSpriteBridge, type BridgeError } from '../lib/bridge';
 import { checkAssetServer } from '../lib/assets';
 import type {
+  CastError,
   Character,
   Project,
   ProjectListEntry,
@@ -43,6 +44,9 @@ interface AppState {
   project: Project | null;
   characters: Character[];
   shots: Shot[];
+  // Per-character on-disk audit from the latest /sprite_show. Empty list
+  // means every character sheet is present and non-zero on disk.
+  castErrors: CastError[];
   status: RenderStatusResponse | null;
   chat: ChatState;
   error: string | null;
@@ -78,6 +82,7 @@ interface AppState {
     refs: string[],
   ): Promise<void>;
   approveCast(): Promise<void>;
+  repairCast(projectId?: string): Promise<void>;
   generateTimeline(): Promise<void>;
   approveTimeline(): Promise<void>;
   startRender(): Promise<void>;
@@ -170,6 +175,7 @@ export const useStore = create<AppState>()(
     project: null,
     characters: [],
     shots: [],
+    castErrors: [],
     status: null,
     chat: { messages: [], isStreaming: false, draft: '' },
     error: null,
@@ -341,6 +347,23 @@ export const useStore = create<AppState>()(
       }
     },
 
+    repairCast: async (projectId) => {
+      const targetId = projectId ?? get().activeProjectId ?? '';
+      if (!targetId) {
+        set({ error: 'no active project to repair' });
+        return;
+      }
+      get().appendChat('user', `/sprite_repair_cast ${targetId}`);
+      try {
+        const r = await call<unknown>('sprite_repair_cast', targetId);
+        get().appendChat('assistant', JSON.stringify(r, null, 2));
+        await get().refreshShow(targetId);
+      } catch (e: unknown) {
+        const err = e as BridgeError;
+        set({ error: err.message ?? 'failed to repair cast' });
+      }
+    },
+
     generateTimeline: async () => {
       get().appendChat('user', '/sprite_timeline');
       try {
@@ -411,6 +434,7 @@ export const useStore = create<AppState>()(
             phase: string;
             characters: Character[];
             shots: Shot[];
+            errors?: CastError[];
           } & Project
         >('sprite_show', targetId);
         const project = normalizeProjectResponse(data);
@@ -420,6 +444,7 @@ export const useStore = create<AppState>()(
           project,
           characters: data?.characters ?? [],
           shots: data?.shots ?? [],
+          castErrors: data?.errors ?? [],
         });
       } catch (e: unknown) {
         const err = e as BridgeError;
@@ -859,4 +884,11 @@ export function selectIsPhaseReachable(
     return s.shots.some((x) => Boolean(x.rendered_video_path));
   }
   return false; // 'done' on a failed project: never reached
+}
+
+// True when the most recent /sprite_show found one or more character sheets
+// missing or zero-byte on disk. CastScreen renders a "repair cast" banner
+// in this state. Healthy projects have an empty list.
+export function selectIsCastIncomplete(s: AppState): boolean {
+  return s.castErrors.length > 0;
 }

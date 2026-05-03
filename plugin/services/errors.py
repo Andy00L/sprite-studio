@@ -85,6 +85,17 @@ class ProviderResponseShapeError(SpriteStudioError):
     The raw response is saved to disk under projects/_debug/ for forensics."""
 
 
+class ImageGenEmptyError(ProviderResponseShapeError):
+    """gpt-image-2 returned 200 OK but the image payload is missing or unusable.
+
+    Distinct from a transport error or a shape error on a different field,
+    because the API quietly returns 200 with empty/short b64_json when the
+    upstream image service flakes or a content filter trips silently. Caller
+    surfaces a moderation-style message and the job row is marked failed
+    so cost accounting matches reality.
+    """
+
+
 class ProviderInsufficientCreditsError(SpriteStudioError):
     """402 — account out of credit. Render worker must surface and pause."""
 

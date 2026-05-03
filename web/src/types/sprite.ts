@@ -105,6 +105,17 @@ export interface Project {
   timeline_status?: TimelineStatus;
 }
 
+// Per-character on-disk audit result surfaced by /sprite_show. A non-empty
+// list means at least one character's master sheet is missing or zero-byte
+// on disk despite the DB persisting a path. The CastScreen renders a
+// "repair cast" banner when this is non-empty.
+export interface CastError {
+  character_id: string;
+  name: string;
+  error_class: 'sheet_missing_on_disk' | 'sheet_zero_bytes';
+  path: string;
+}
+
 export interface ProgressEvent {
   project_id: string;
   timestamp: number;

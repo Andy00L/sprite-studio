@@ -21,6 +21,7 @@ from ulid import ULID
 from .. import db, env
 from . import _concurrency, _http, _pricing, _retry
 from .errors import (
+    ImageGenEmptyError,
     ProviderInvalidRequestError,
     ProviderResponseShapeError,
     SpriteStudioError,
@@ -28,6 +29,11 @@ from .errors import (
 
 
 logger = logging.getLogger("sprite_studio.services.gpt_image")
+
+# A 1024x1024 PNG from gpt-image-2 is normally 400 KB-2 MB. Anything below
+# this floor is decoded but rejected: a smaller blob has been observed when
+# the upstream image service streams a placeholder or a header-only response.
+_MIN_IMAGE_BYTES = 1024
 
 IMAGE_MODEL = "openai/gpt-5.4-image-2"
 
@@ -137,7 +143,7 @@ class ImageClient:
 
         elapsed = time.perf_counter() - started
         try:
-            paths = self._extract_and_save(resp, save_to=save_to)
+            paths = self._extract_and_save(resp, save_to=save_to, expected_count=n)
             usage = (resp.json() or {}).get("usage", {}) or {}
         except SpriteStudioError as e:
             if job_row:
@@ -281,7 +287,7 @@ class ImageClient:
 
         elapsed = time.perf_counter() - started
         try:
-            paths = self._extract_and_save(resp, save_to=save_to)
+            paths = self._extract_and_save(resp, save_to=save_to, expected_count=1)
         except SpriteStudioError as e:
             if job_row:
                 db.mark_job_failed(job_row["id"], str(e))
@@ -319,6 +325,7 @@ class ImageClient:
         resp: httpx.Response,
         *,
         save_to: Path,
+        expected_count: int = 1,
     ) -> list[Path]:
         try:
             data = resp.json()
@@ -328,41 +335,20 @@ class ImageClient:
                 "non-json image response",
                 provider="tokenrouter", model=IMAGE_MODEL,
             ) from e
-        items = data.get("data") or []
-        if not items:
-            self._dump_raw(resp, "empty_data")
-            raise ProviderResponseShapeError(
-                "response data array empty",
-                provider="tokenrouter", model=IMAGE_MODEL,
-            )
+
+        try:
+            blobs = _validate_image_response(data, expected_count=expected_count)
+        except ImageGenEmptyError as e:
+            self._dump_raw(resp, e.extra.get("dump_tag") or "empty_image")
+            raise
 
         out_paths: list[Path] = []
-        for i, item in enumerate(items):
-            b64 = item.get("b64_json") if isinstance(item, dict) else None
-            if not b64:
-                self._dump_raw(resp, f"missing_b64_idx{i}")
-                raise ProviderResponseShapeError(
-                    "data[].b64_json missing",
-                    provider="tokenrouter", model=IMAGE_MODEL,
-                )
-            try:
-                raw = base64.b64decode(b64)
-            except Exception as e:
-                raise ProviderResponseShapeError(
-                    "data[].b64_json not valid base64",
-                    provider="tokenrouter", model=IMAGE_MODEL,
-                ) from e
+        for raw in blobs:
             file_id = str(ULID())
             out = save_to / f"{file_id}.png"
             try:
-                out.write_bytes(raw)
+                _atomic_write_image(out, raw)
             except OSError as e:
-                # Disk full / perms. Best-effort cleanup of partial file.
-                try:
-                    if out.exists():
-                        out.unlink()
-                except Exception:
-                    pass
                 raise SpriteStudioError(
                     f"OS error during image save: {e}",
                     provider="local", model=IMAGE_MODEL,
@@ -389,3 +375,100 @@ class ImageClient:
             except Exception:
                 return
         logger.warning("image debug dump: %s", p)
+
+
+def _validate_image_response(
+    payload: dict,
+    *,
+    expected_count: int = 1,
+) -> list[bytes]:
+    """Decode + sanity-check gpt-image-2's response body.
+
+    The provider sometimes returns 200 OK with an empty data list, an empty
+    b64_json field, or a header-only blob shorter than _MIN_IMAGE_BYTES.
+    Each of those would otherwise produce a zero-byte sheet on disk that
+    later 404s through the asset server. Raising ImageGenEmptyError up
+    front lets the job row land in 'failed' so cost reporting matches.
+    """
+    items = payload.get("data") or []
+    if len(items) < expected_count:
+        raise ImageGenEmptyError(
+            f"expected {expected_count} images, got {len(items)}",
+            provider="tokenrouter",
+            model=IMAGE_MODEL,
+            extra={
+                "payload_keys": list(payload.keys()),
+                "dump_tag": "empty_data",
+            },
+        )
+
+    blobs: list[bytes] = []
+    for i, item in enumerate(items):
+        b64 = item.get("b64_json") if isinstance(item, dict) else None
+        if not b64:
+            raise ImageGenEmptyError(
+                f"image {i}: empty or missing b64_json",
+                provider="tokenrouter",
+                model=IMAGE_MODEL,
+                extra={
+                    "item_keys": list(item.keys()) if isinstance(item, dict) else [],
+                    "dump_tag": f"missing_b64_idx{i}",
+                },
+            )
+        try:
+            blob = base64.b64decode(b64, validate=True)
+        except Exception as e:
+            raise ImageGenEmptyError(
+                f"image {i}: base64 decode failed: {e}",
+                provider="tokenrouter",
+                model=IMAGE_MODEL,
+                extra={"dump_tag": f"bad_b64_idx{i}"},
+            ) from e
+        if len(blob) < _MIN_IMAGE_BYTES:
+            raise ImageGenEmptyError(
+                f"image {i}: decoded blob is {len(blob)} bytes "
+                f"(< {_MIN_IMAGE_BYTES} byte floor)",
+                provider="tokenrouter",
+                model=IMAGE_MODEL,
+                extra={
+                    "decoded_bytes": len(blob),
+                    "dump_tag": f"tiny_blob_idx{i}",
+                },
+            )
+        blobs.append(blob)
+    return blobs
+
+
+def _atomic_write_image(path: Path, blob: bytes) -> None:
+    """Write image bytes via tmp + rename + post-write size verify.
+
+    The bug shape that motivated this: the provider returns 200, write_bytes
+    succeeds in the buffer cache, the rename to sheet.png lands, and yet a
+    later read finds the file missing. Wrapping the write in tmp + replace
+    + an explicit st_size check raises immediately if the bytes did not
+    land, so the caller never persists master_sheet_path against a
+    non-existent file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_bytes(blob)
+        wrote = tmp.stat().st_size
+        if wrote != len(blob):
+            raise IOError(
+                f"short write at {tmp}: wrote {wrote}/{len(blob)} bytes",
+            )
+        tmp.replace(path)
+    except Exception:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        raise
+
+    if not path.exists() or path.stat().st_size != len(blob):
+        raise IOError(
+            f"post-rename verify failed at {path}: "
+            f"exists={path.exists()} size_mismatch",
+        )

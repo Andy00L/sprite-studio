@@ -33,6 +33,7 @@ provides_commands:
   - sprite_add_shot
   - sprite_delete_shot
   - sprite_set_project_refs
+  - sprite_repair_cast
 provides_hooks: []
 requires_env:
   - name: TOKENROUTER_API_KEY

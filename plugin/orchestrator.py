@@ -154,6 +154,25 @@ class CastGenerationFailedError(OrchestratorError):
     pass
 
 
+class CastIncompleteError(OrchestratorError):
+    """A cast advance / approve / repair gate found ≥1 sheet missing on disk.
+
+    Carries the per-character missing list so the slash-command surface can
+    tell the user exactly which characters need /sprite_repair_cast (or a
+    targeted /sprite_edit_character regenerate). Distinct from a generation
+    failure: the DB has paths, but the bytes are not there.
+    """
+
+    def __init__(self, project_id: str, missing: list[tuple[str, str]]) -> None:
+        self.project_id = project_id
+        self.missing = missing
+        names = ", ".join(n for n, _ in missing) or "(none)"
+        super().__init__(
+            f"{len(missing)} character sheet(s) missing on disk for "
+            f"project {project_id}: {names}",
+        )
+
+
 class CharacterNotFoundError(OrchestratorError):
     pass
 
@@ -934,13 +953,16 @@ class ProjectOrchestrator:
         chars = db.list_characters(project_id)
         if not chars:
             raise OrchestratorError("cannot approve an empty cast")
-        missing = [c for c in chars if not c.get("master_sheet_path")]
-        if missing:
-            names = ", ".join(c["name"] for c in missing)
-            raise OrchestratorError(
-                f"cannot approve: characters missing master sheets: {names}. "
-                f"fix individually with /sprite_edit_character before approving.",
-            )
+
+        # Gate on disk before flipping to timeline. The DB-level
+        # master_sheet_path-is-None check covers generation failures; the
+        # on-disk audit covers the case where DB says ok but bytes have
+        # vanished (silent provider response, external cleanup, etc.).
+        # Without this, /sprite_approve_cast would advance to timeline
+        # and the writer's reference_still loop would 404 on every shot.
+        on_disk_missing = self._audit_cast_sheets_on_disk(project_id)
+        if on_disk_missing:
+            raise CastIncompleteError(project_id, on_disk_missing)
 
         ts = db.now_ts()
         with db.txn() as conn:
@@ -1869,6 +1891,23 @@ class ProjectOrchestrator:
             db.update_character(char_id, master_sheet_path=None, edit_history=[err_msg])
             return None, err_msg
 
+        # Verify the file actually landed before persisting the path. Without
+        # this, a silent provider failure or a race against an external
+        # cleanup leaves the DB pointing at a missing file, and every
+        # downstream reference still / approve-cast call has to rediscover
+        # that fact via 404.
+        if not target_path.exists() or target_path.stat().st_size == 0:
+            err_msg = (
+                f"post_write_verify_failed: target missing or empty at "
+                f"{target_path}"
+            )
+            logger.warning(
+                "sheet post-write verify failed character=%s path=%s",
+                char_id, target_path,
+            )
+            db.update_character(char_id, master_sheet_path=None, edit_history=[err_msg])
+            return None, err_msg
+
         db.update_character(char_id, master_sheet_path=str(target_path))
         return str(target_path), None
 
@@ -1888,10 +1927,232 @@ class ProjectOrchestrator:
         )
 
     async def _finalize_cast_phase(self, project_id: str) -> None:
+        # Set phase=cast first so cast-phase recovery commands
+        # (/sprite_edit_character, /sprite_repair_cast) work even when the
+        # audit below trips. Without that ordering, an audit failure would
+        # strand the user with character rows inserted but phase=brief, and
+        # /sprite_cast would re-run the cast designer and duplicate them.
         try:
             db.set_phase(project_id, "cast")
         except Exception:
             logger.exception("could not set project phase=cast project=%s", project_id)
+
+        missing = self._audit_cast_sheets_on_disk(project_id)
+        if missing:
+            err_summary = (
+                f"cast_incomplete: {len(missing)} character sheet(s) missing on "
+                f"disk: " + "; ".join(f"{n}: {r}" for n, r in missing)
+            )
+            try:
+                db.set_phase(project_id, "cast", error_message=err_summary)
+            except Exception:
+                logger.exception(
+                    "could not record cast_incomplete error project=%s",
+                    project_id,
+                )
+            logger.warning("cast advance gate blocked project=%s %s",
+                           project_id, err_summary)
+            raise CastIncompleteError(project_id, missing)
+
+    async def regenerate_character_sheet(
+        self,
+        character: dict,
+    ) -> Path:
+        """Re-run master-sheet generation for a single character using its
+        existing visual_description + project preset + project refs. Used
+        by /sprite_repair_cast to fix sheets whose bytes vanished after
+        the original cast advance succeeded.
+
+        Raises OrchestratorError on resolution failure (project gone, refs
+        invalid). Provider/SpriteStudio errors propagate so the caller can
+        record per-character failure reasons.
+        """
+        char_id = character["id"]
+        project_id = character["project_id"]
+        project = db.get_project(project_id)
+        if project is None:
+            raise OrchestratorError(
+                f"parent project missing: {project_id}",
+            )
+
+        try:
+            preset = get_preset(project["style_preset_id"])
+        except StylePresetLoadError:
+            preset = get_preset(DEFAULT_PRESET_ID)
+
+        try:
+            project_refs = json.loads(project.get("ref_image_paths") or "[]")
+        except (TypeError, ValueError):
+            project_refs = []
+        if not isinstance(project_refs, list):
+            project_refs = []
+
+        cast_dir = PROJECTS_ROOT / project_id / "cast"
+        cast_dir.mkdir(parents=True, exist_ok=True)
+
+        sheet_path, err = await self._generate_master_sheet(
+            project_id=project_id,
+            character=character,
+            preset=preset,
+            cast_dir=cast_dir,
+            ref_image_paths=project_refs,
+        )
+        if not sheet_path:
+            raise OrchestratorError(
+                f"sheet regeneration failed for {character['name']!r}: "
+                f"{err or 'unknown error'}",
+            )
+        return Path(sheet_path)
+
+    async def repair_cast(self, *, project_id: str) -> dict:
+        """Regenerate any character sheets whose bytes are missing on disk.
+
+        Idempotent: characters whose sheet exists at the persisted path are
+        skipped. After regeneration, if the project is in 'timeline' phase
+        and at least one character was repaired, also re-run the reference
+        still pass for shots that include any repaired character so the
+        downstream renderer is unblocked.
+        """
+        if not db._is_valid_ulid(project_id):
+            raise ValueError(f"invalid project_id: {project_id!r}")
+
+        project = db.get_project(project_id)
+        if project is None:
+            raise OrchestratorError(f"unknown project: {project_id}")
+
+        characters = db.list_characters(project_id)
+        if not characters:
+            raise OrchestratorError(
+                f"project {project_id} has no characters to repair",
+            )
+
+        repaired: list[dict] = []
+        skipped: list[dict] = []
+        repaired_ids: set[str] = set()
+        for c in characters:
+            path_str = c.get("master_sheet_path")
+            p = Path(path_str) if path_str else None
+            if p is not None and p.exists() and p.stat().st_size > 0:
+                skipped.append({
+                    "id": c["id"],
+                    "name": c["name"],
+                    "reason": "sheet ok on disk",
+                })
+                continue
+            try:
+                new_path = await self.regenerate_character_sheet(c)
+                repaired.append({
+                    "id": c["id"],
+                    "name": c["name"],
+                    "path": str(new_path),
+                })
+                repaired_ids.add(c["id"])
+            except (SpriteStudioError, OrchestratorError, ValueError) as e:
+                skipped.append({
+                    "id": c["id"],
+                    "name": c["name"],
+                    "reason": f"regeneration failed: {e}",
+                })
+
+        # If the broken project already advanced to timeline, the reference
+        # stills point at sheet bytes we just rewrote; the writer's cached
+        # path is stale (or was never produced). Regenerate stills for
+        # shots that include any repaired character.
+        regenerated_stills: list[dict] = []
+        still_errors: list[dict] = []
+        if project["phase"] == "timeline" and repaired_ids:
+            try:
+                preset = get_preset(project["style_preset_id"])
+            except StylePresetLoadError:
+                preset = get_preset(DEFAULT_PRESET_ID)
+            char_lookup = {c["id"]: c for c in db.list_characters(project_id)}
+            shots = db.list_shots(project_id)
+            affected = [
+                s for s in shots
+                if any(cid in repaired_ids for cid in s.get("characters_present", []))
+            ]
+            for shot in affected:
+                chars_in_shot = [
+                    char_lookup[cid]
+                    for cid in shot["characters_present"]
+                    if cid in char_lookup
+                ]
+                try:
+                    ref_path = await self._generate_reference_still(
+                        project_id=project_id,
+                        shot=shot,
+                        chars_in_shot=chars_in_shot,
+                        preset=preset,
+                    )
+                    db.update_shot(shot["id"], reference_still_path=str(ref_path))
+                    regenerated_stills.append({
+                        "shot_id": shot["id"],
+                        "ordinal": shot["ordinal"],
+                        "path": str(ref_path),
+                    })
+                except (SpriteStudioError, OrchestratorError) as e:
+                    still_errors.append({
+                        "shot_id": shot["id"],
+                        "ordinal": shot["ordinal"],
+                        "error_msg": str(e),
+                    })
+
+        # Clear the project-level error_message if the audit is now clean.
+        # Otherwise /sprite_show keeps surfacing the stale "cast_incomplete"
+        # banner even after a successful repair.
+        post_audit = self._audit_cast_sheets_on_disk(project_id)
+        if not post_audit:
+            try:
+                with db.txn() as conn:
+                    conn.execute(
+                        "UPDATE projects SET error_message = NULL, "
+                        "updated_at = ? WHERE id = ?",
+                        (db.now_ts(), project_id),
+                    )
+            except Exception:
+                logger.exception(
+                    "repair_cast: could not clear error_message project=%s",
+                    project_id,
+                )
+
+        logger.info(
+            "repair_cast project=%s repaired=%d skipped=%d stills=%d",
+            project_id, len(repaired), len(skipped), len(regenerated_stills),
+        )
+        return {
+            "project_id": project_id,
+            "phase": project["phase"],
+            "repaired": repaired,
+            "skipped": skipped,
+            "regenerated_stills": regenerated_stills,
+            "still_errors": still_errors,
+            "audit_clean": not post_audit,
+        }
+
+    def _audit_cast_sheets_on_disk(
+        self,
+        project_id: str,
+    ) -> list[tuple[str, str]]:
+        """Return (name, reason) for every character whose sheet is not
+        usable on disk. A character with master_sheet_path=None means the
+        underlying generation never produced a file. A character with a
+        path set but no file (or zero-byte file) means the bytes vanished
+        between generate-time and now (provider returned empty / external
+        cleanup / disk full at write).
+        """
+        characters = db.list_characters(project_id)
+        missing: list[tuple[str, str]] = []
+        for c in characters:
+            path_str = c.get("master_sheet_path")
+            if not path_str:
+                missing.append((c["name"], "no path persisted"))
+                continue
+            p = Path(path_str)
+            if not p.exists():
+                missing.append((c["name"], f"path missing: {p}"))
+            elif p.stat().st_size == 0:
+                missing.append((c["name"], f"zero-byte file: {p}"))
+        return missing
 
     async def _cleanup_after_cancel(
         self,
